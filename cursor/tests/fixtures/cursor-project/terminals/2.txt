@@ -1,0 +1,15 @@
+---
+pid: 102
+cwd: "__WORKSPACE__"
+command: "different command"
+title: "Inferred command"
+status: succeeded
+started_at: 2026-08-19T08:01:00Z
+running_for_ms: 20
+---
+inferred output
+---
+exit_code: 0
+elapsed_ms: 20
+ended_at: 2026-08-19T08:01:00Z
+---

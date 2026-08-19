@@ -1,0 +1,2 @@
+{"role":"user","message":{"content":[{"type":"text","text":"Referenced fixture points back to aaaaaaaa."}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Reference cycle recorded."}]}}

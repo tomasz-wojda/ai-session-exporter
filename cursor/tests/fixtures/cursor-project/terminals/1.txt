@@ -1,0 +1,15 @@
+---
+pid: 101
+cwd: "__WORKSPACE__"
+command: "echo ok"
+title: "Fixture command"
+status: succeeded
+started_at: 2026-08-19T08:00:00Z
+running_for_ms: 15
+---
+ok
+---
+exit_code: 0
+elapsed_ms: 15
+ended_at: 2026-08-19T08:00:00Z
+---

@@ -1,0 +1,2 @@
+not-json
+{"role":"user","message":{"content":[{"type":"text","text":"Valid record after malformed input."}]}}
