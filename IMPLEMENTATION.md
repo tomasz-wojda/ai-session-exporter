@@ -86,3 +86,26 @@
 ## Reference intelligence semantic commit information
 - Title: `feat(cursor-exporter): add reference intelligence`
 - Description: `Classify session references by evidence, confidence, relevance, depth, and cycles while adding scoped exports and deterministic graph views for forensic and restoration workflows.`
+
+## Persistent configuration checklist
+- [x] 1. Add `config` command dispatch without requiring a session ID.
+- [x] 2. Add strict version-1 config parsing, display, partial updates, and unsetting.
+- [x] 3. Add atomic config replacement with `0700` directory and `0600` file permissions.
+- [x] 4. Merge export options using CLI, config, then built-in/inferred precedence.
+- [x] 5. Change the default reference scope from `recursive` to `relevant`.
+- [x] 6. Document persistent configuration and session-ID discovery in `README.md`.
+- [x] 7. Update `PLAN.md` with configuration behavior and reliability requirements.
+- [x] 8. Extend fixtures for configuration, precedence, defaults, errors, and permissions.
+
+## Persistent configuration verification
+- Fixture suite: `groovy tests/cursor-session-exporter-test.groovy` passed.
+- Test subprocesses use an isolated `user.home` and never read or write the real user configuration.
+- Config fixtures verified missing-file display, creation, partial updates, complete unsetting, malformed JSON, unknown keys, invalid scopes, and preservation after rejected updates.
+- Export fixtures verified saved defaults, CLI overrides, config-based validation, and the new `relevant` default.
+- POSIX fixtures verified `0700` on the config directory and `0600` on `config.json`.
+- Recursive scope remains covered explicitly after changing the default.
+- No commit or push was performed.
+
+## Persistent configuration semantic commit information
+- Title: `feat(cursor-exporter): add persistent configuration`
+- Description: `Persist exporter paths and reference scope securely while adding deterministic precedence, relevant-by-default exports, and session-discovery guidance.`

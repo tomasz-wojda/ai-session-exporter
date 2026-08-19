@@ -43,6 +43,16 @@ class SessionExporter {
     static final Map<String, Integer> CONFIDENCE_RANK = [low: 1, medium: 2, high: 3]
     static final Map<String, Integer> EVIDENCE_RANK = [tool_input: 1, shell_command: 2, file_content: 3, transcript_path: 4, summary: 5, message: 6, explicit_session_link: 7]
     static final Set<String> REFERENCE_SCOPES = ['recursive', 'direct', 'relevant', 'none'] as Set
+    static final int CONFIG_VERSION = 1
+    static final Map<String, String> PATH_OPTIONS = [
+        '--output-dir': 'outputDir',
+        '--transcript-root': 'transcriptRoot',
+        '--terminal-root': 'terminalRoot',
+        '--agent-tool-root': 'agentToolRoot',
+        '--workspace': 'workspace'
+    ]
+    static final Set<String> CONFIG_KEYS = (PATH_OPTIONS.values() + ['referenceScope']) as Set
+    static final Set<String> PROJECT_CONFIG_KEYS = ['transcriptRoot', 'terminalRoot', 'agentToolRoot', 'workspace'] as Set
 
     Map options
     Path scriptDir
@@ -64,7 +74,12 @@ class SessionExporter {
 
     static int run(String[] args, Path scriptDir) {
         try {
-            Map options = parseArguments(args)
+            SessionExporter configSupport = new SessionExporter([:], scriptDir)
+            if (args && args[0] == 'config') {
+                configSupport.configure(args.drop(1) as String[])
+                return 0
+            }
+            Map options = parseArguments(args, configSupport.loadConfig())
             SessionExporter exporter = new SessionExporter(options, scriptDir)
             exporter.execute()
             return 0
@@ -77,12 +92,18 @@ class SessionExporter {
         }
     }
 
-    static Map parseArguments(String[] args) {
+    static Map parseArguments(String[] args, Map savedConfig = [version: CONFIG_VERSION]) {
         if (!args || args[0] in ['--help', '-h']) {
-            throw new ExportFailure(2, 'usage: groovy cursor-session-exporter.groovy <session_id> [--reference-scope recursive|direct|relevant|none] [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--validate-only]')
+            throw new ExportFailure(2, 'usage: cursor-session-exporter <session_id> [--reference-scope recursive|direct|relevant|none] [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--validate-only] | cursor-session-exporter config [persistent options] [--unset KEY]')
         }
-        Map options = [sessionId: args[0], validateOnly: false, referenceScope: 'recursive']
-        Set<String> pathOptions = ['--output-dir', '--transcript-root', '--terminal-root', '--agent-tool-root', '--workspace'] as Set
+        Map options = [sessionId: args[0], validateOnly: false, referenceScope: 'relevant']
+        savedConfig.each { String key, Object value ->
+            if (PATH_OPTIONS.containsValue(key)) {
+                options[key] = Paths.get(value.toString()).toAbsolutePath().normalize()
+            } else if (key == 'referenceScope') {
+                options.referenceScope = value.toString()
+            }
+        }
         int index = 1
         while (index < args.length) {
             String argument = args[index]
@@ -99,16 +120,10 @@ class SessionExporter {
                 index += 2
                 continue
             }
-            if (!pathOptions.contains(argument) || index + 1 >= args.length) {
+            if (!PATH_OPTIONS.containsKey(argument) || index + 1 >= args.length) {
                 throw new ExportFailure(2, "invalid argument: ${argument}")
             }
-            String key = [
-                '--output-dir': 'outputDir',
-                '--transcript-root': 'transcriptRoot',
-                '--terminal-root': 'terminalRoot',
-                '--agent-tool-root': 'agentToolRoot',
-                '--workspace': 'workspace'
-            ][argument]
+            String key = PATH_OPTIONS[argument]
             options[key] = Paths.get(args[index + 1]).toAbsolutePath().normalize()
             index += 2
         }
@@ -117,6 +132,146 @@ class SessionExporter {
             throw new ExportFailure(3, "malformed session identifier: ${sessionId}")
         }
         options
+    }
+
+    void configure(String[] args) {
+        if (args && args[0] in ['--help', '-h']) {
+            throw new ExportFailure(2, 'usage: cursor-session-exporter config [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--reference-scope recursive|direct|relevant|none] [--unset KEY]')
+        }
+        Map stored = loadConfig()
+        if (!args) {
+            println(JsonOutput.prettyPrint(canonicalJson(stored)))
+            return
+        }
+        Map updates = [:]
+        Set<String> removals = new LinkedHashSet<>()
+        int index = 0
+        while (index < args.length) {
+            String argument = args[index]
+            if (argument == '--unset') {
+                if (index + 1 >= args.length || !CONFIG_KEYS.contains(args[index + 1])) {
+                    throw new ExportFailure(2, '--unset requires one of: ' + CONFIG_KEYS.sort().join(', '))
+                }
+                removals << args[index + 1]
+                index += 2
+                continue
+            }
+            if (argument == '--reference-scope') {
+                if (index + 1 >= args.length || !REFERENCE_SCOPES.contains(args[index + 1])) {
+                    throw new ExportFailure(2, 'reference scope must be recursive, direct, relevant, or none')
+                }
+                updates.referenceScope = args[index + 1]
+                index += 2
+                continue
+            }
+            if (!PATH_OPTIONS.containsKey(argument) || index + 1 >= args.length) {
+                throw new ExportFailure(2, "invalid config argument: ${argument}")
+            }
+            String rawPath = args[index + 1]
+            if (!rawPath.trim()) {
+                throw new ExportFailure(2, "${argument} requires a non-empty path")
+            }
+            updates[PATH_OPTIONS[argument]] = Paths.get(rawPath).toAbsolutePath().normalize().toString()
+            index += 2
+        }
+        if (!updates.isEmpty() && !removals.isEmpty()) {
+            throw new ExportFailure(2, 'config values and --unset cannot be combined')
+        }
+        Map result = new LinkedHashMap(stored)
+        updates.each { key, value -> result[key] = value }
+        removals.each { result.remove(it) }
+        result.version = CONFIG_VERSION
+        saveConfig(result)
+        if (!updates.keySet().intersect(PROJECT_CONFIG_KEYS).isEmpty()) {
+            System.err.println('cursor-session-exporter: warning: saved project-specific paths apply to every export unless overridden on the command line')
+        }
+        println(JsonOutput.prettyPrint(canonicalJson(result)))
+    }
+
+    Path configDirectory() {
+        Paths.get(System.getProperty('user.home'), '.cursor-session-exporter').toAbsolutePath().normalize()
+    }
+
+    Path configPath() {
+        configDirectory().resolve('config.json')
+    }
+
+    Map loadConfig() {
+        Path path = configPath()
+        if (!Files.exists(path)) {
+            return [version: CONFIG_VERSION]
+        }
+        validateConfigPermissions(path)
+        Object parsed
+        try {
+            parsed = new JsonSlurper().parse(path.toFile())
+        } catch (Throwable failure) {
+            throw new ExportFailure(2, "invalid config JSON at ${path}: ${failure.message}")
+        }
+        if (!(parsed instanceof Map)) {
+            throw new ExportFailure(2, "config must be a JSON object: ${path}")
+        }
+        Map config = parsed as Map
+        Set<String> allowed = (CONFIG_KEYS + ['version']) as Set
+        Set<String> unknown = config.keySet().collect { it.toString() }.findAll { !allowed.contains(it) } as Set
+        if (!unknown.isEmpty()) {
+            throw new ExportFailure(2, "unknown config keys at ${path}: ${unknown.sort().join(', ')}")
+        }
+        if (config.version != CONFIG_VERSION) {
+            throw new ExportFailure(2, "unsupported config version at ${path}: ${config.version}")
+        }
+        CONFIG_KEYS.each { String key ->
+            if (!config.containsKey(key)) {
+                return
+            }
+            Object value = config[key]
+            if (!(value instanceof String) || !value.toString().trim()) {
+                throw new ExportFailure(2, "config value must be a non-empty string: ${key}")
+            }
+            if (key == 'referenceScope') {
+                if (!REFERENCE_SCOPES.contains(value.toString())) {
+                    throw new ExportFailure(2, "invalid reference scope in config: ${value}")
+                }
+            } else if (!Paths.get(value.toString()).isAbsolute()) {
+                throw new ExportFailure(2, "config path must be absolute: ${key}")
+            }
+        }
+        config
+    }
+
+    void saveConfig(Map config) {
+        Path directory = configDirectory()
+        Path destination = configPath()
+        Path temporary = directory.resolve(".config-${UUID.randomUUID()}.tmp")
+        secureDirectories(directory)
+        try {
+            if (supportsPosix(directory)) {
+                Files.createFile(temporary, PosixFilePermissions.asFileAttribute(FILE_PERMISSIONS))
+            } else {
+                Files.createFile(temporary)
+                secureFile(temporary)
+            }
+            Files.writeString(temporary, JsonOutput.prettyPrint(canonicalJson(config)) + '\n', StandardCharsets.UTF_8)
+            secureFile(temporary)
+            new JsonSlurper().parse(temporary.toFile())
+            replacePath(temporary, destination)
+            secureFile(destination)
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
+    void validateConfigPermissions(Path path) {
+        if (!supportsPosix(path)) {
+            return
+        }
+        if (Files.getPosixFilePermissions(path) != FILE_PERMISSIONS) {
+            throw new ExportFailure(2, "config file permissions must be 0600: ${path}")
+        }
+        Path directory = path.parent
+        if (directory != null && Files.getPosixFilePermissions(directory) != DIRECTORY_PERMISSIONS) {
+            throw new ExportFailure(2, "config directory permissions must be 0700: ${directory}")
+        }
     }
 
     void execute() {
@@ -1740,6 +1895,14 @@ class SessionExporter {
             Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE)
         } catch (AtomicMoveNotSupportedException ignored) {
             Files.move(source, destination)
+        }
+    }
+
+    static void replacePath(Path source, Path destination) {
+        try {
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING)
         }
     }
 

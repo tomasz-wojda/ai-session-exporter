@@ -5,15 +5,18 @@
 - Create `cursor/tests/cursor-session-exporter-test.groovy` with isolated fixtures under `cursor/tests/fixtures/`.
 - Export bundles under `cursor/sessions-export/<full-session-uuid>/`.
 - Preserve the approved implementation checklist and verification record in `IMPLEMENTATION.md`.
-- Do not create commits, push changes, or add documentation beyond `PLAN.md` and `IMPLEMENTATION.md`.
+- Maintain user-facing installation and usage guidance in `README.md`; do not create commits or push changes.
 
 ## CLI and discovery
 - Invoke with `groovy cursor-session-exporter.groovy <session_id>`.
+- Invoke `cursor-session-exporter config` without a session ID to print or update persistent defaults.
 - Accept a full UUID or a unique eight-character hexadecimal prefix.
 - Search Cursor transcript roots matching `~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl`.
 - Reject malformed, missing, and ambiguous identifiers with distinct nonzero exit codes.
 - Support output, transcript-root, terminal-root, agent-tool-root, and workspace overrides.
-- Support `--reference-scope recursive|direct|relevant|none`, defaulting to `recursive`.
+- Support `--reference-scope recursive|direct|relevant|none`, defaulting to `relevant`.
+- Persist supplied output, source-root, workspace, and reference-scope options in `~/.cursor-session-exporter/config.json`.
+- Resolve export options in CLI, saved-config, built-in/inference order.
 - Use Groovy and JDK facilities only.
 
 ## Export model
@@ -69,6 +72,10 @@
 - Apply permissions during staging, after copied attributes, before atomic replacement, and after replacement.
 - Use POSIX permissions where available and owner-only Java file flags as a best-effort fallback.
 - Keep validation read-only while reporting any POSIX permission mismatch.
+- Store global configuration as strict version-1 JSON with allowlisted keys and absolute normalized paths.
+- Support sparse partial updates and repeatable `--unset` operations without silently persisting export-only arguments.
+- Write configuration atomically with `0700` on its directory and `0600` on the file.
+- Reject malformed, unsupported, unknown-key, or insecure configuration before exporting.
 
 ## Verification
 - Cover UUID and prefix resolution, malformed input, extraction, revision reconstruction, command correlation, recursive references, cycles, checksums, determinism, incremental reuse, and atomic recovery.
@@ -76,6 +83,8 @@
 - Run a real export for `6ab4f267-fa2e-4f6f-9cec-8a06fd864a6f`.
 - Verify known Automox references, successful and failed/background command evidence, and bundle validation.
 - Verify all POSIX export directories are `0700` and all export files are `0600`, including copied artifacts and terminal logs.
+- Verify persistent configuration display, partial updates, unsetting, CLI precedence, defaults, atomic replacement, and owner-only permissions.
+- Verify README guidance for installation, configuration, session-ID discovery, scopes, and sensitive export contents.
 - Provide a semantic commit title and description without committing or pushing.
 
 IMPLEMENTATION CHECKLIST:
@@ -111,3 +120,12 @@ REFERENCE INTELLIGENCE CHECKLIST:
 6. Integrate schema v2 restoration, reporting, validation, and console summaries.
 7. Extend fixtures for classifications, precedence, cycles, scopes, omission handling, determinism, and permissions.
 8. Regenerate and validate the real session bundle.
+
+PERSISTENT CONFIGURATION CHECKLIST:
+1. Add `config` command dispatch without requiring a session ID.
+2. Add strict versioned config parsing, display, partial updates, and unsetting.
+3. Add owner-only atomic config writes under `~/.cursor-session-exporter/`.
+4. Merge CLI, config, and built-in/inferred values deterministically.
+5. Change the built-in reference scope to `relevant`.
+6. Document configuration and session-ID discovery in `README.md`.
+7. Isolate and extend fixtures for config behavior, permissions, precedence, and defaults.

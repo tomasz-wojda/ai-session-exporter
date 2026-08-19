@@ -13,7 +13,11 @@ import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 
 Map runCommand(List<String> command, Path directory) {
-    Process process = new ProcessBuilder(command).directory(directory.toFile()).redirectErrorStream(true).start()
+    List<String> effectiveCommand = new ArrayList<>(command)
+    if (!effectiveCommand.isEmpty() && effectiveCommand.first() == 'groovy') {
+        effectiveCommand.add(1, "-Duser.home=${System.getProperty('session.exporter.test.home')}".toString())
+    }
+    Process process = new ProcessBuilder(effectiveCommand).directory(directory.toFile()).redirectErrorStream(true).start()
     String output = process.inputStream.getText(StandardCharsets.UTF_8.name())
     int exitCode = process.waitFor()
     [exitCode: exitCode, output: output]
@@ -75,6 +79,8 @@ Path exporter = cursorRoot.resolve('cursor-session-exporter.groovy')
 assert !Files.exists(cursorRoot.resolve('session-exporter.groovy'))
 Path fixtureRoot = cursorRoot.resolve('tests/fixtures')
 Path temporary = Files.createTempDirectory('session-exporter-test-')
+Path testHome = temporary.resolve('home')
+System.setProperty('session.exporter.test.home', testHome.toString())
 Path project = temporary.resolve('cursor-project')
 Path workspace = temporary.resolve('workspace')
 Path output = temporary.resolve('output')
@@ -96,6 +102,94 @@ Files.list(project.resolve('terminals')).withCloseable { stream ->
     }
 }
 
+Path configHome = testHome.resolve('.cursor-session-exporter')
+Path configPath = configHome.resolve('config.json')
+Map emptyConfig = runCommand(['groovy', exporter.toString(), 'config'], cursorRoot)
+assert emptyConfig.exitCode == 0: emptyConfig.output
+assert new JsonSlurper().parseText(emptyConfig.output) == [version: 1]
+assert !Files.exists(configPath)
+
+Path configuredOutput = temporary.resolve('configured-output')
+Map saveConfig = runCommand([
+    'groovy', exporter.toString(), 'config',
+    '--output-dir', configuredOutput.toString(),
+    '--transcript-root', project.resolve('agent-transcripts').toString(),
+    '--terminal-root', project.resolve('terminals').toString(),
+    '--agent-tool-root', project.resolve('agent-tools').toString(),
+    '--workspace', workspace.toString(),
+    '--reference-scope', 'recursive'
+], cursorRoot)
+assert saveConfig.exitCode == 0: saveConfig.output
+Map storedConfig = new JsonSlurper().parse(configPath.toFile()) as Map
+assert storedConfig.version == 1
+assert storedConfig.outputDir == configuredOutput.toString()
+assert storedConfig.referenceScope == 'recursive'
+assert storedConfig.workspace == workspace.toString()
+if (supportsPosix(configHome)) {
+    assert PosixFilePermissions.toString(Files.getPosixFilePermissions(configHome)) == 'rwx------'
+    assert PosixFilePermissions.toString(Files.getPosixFilePermissions(configPath)) == 'rw-------'
+}
+
+Map configuredExport = runCommand(['groovy', exporter.toString(), 'aaaaaaaa'], cursorRoot)
+assert configuredExport.exitCode == 0: configuredExport.output
+Path configuredBundle = configuredOutput.resolve('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+Map configuredGraph = new JsonSlurper().parse(configuredBundle.resolve('aaaaaaaa-reference-graph.json').toFile()) as Map
+assert configuredGraph.referenceScope == 'recursive'
+assert (configuredGraph.exportedSessions as List).size() == 4
+
+Path overrideOutput = temporary.resolve('override-output')
+Map overrideExport = runCommand([
+    'groovy', exporter.toString(), 'aaaaaaaa',
+    '--output-dir', overrideOutput.toString(),
+    '--reference-scope', 'none'
+], cursorRoot)
+assert overrideExport.exitCode == 0: overrideExport.output
+Map overrideGraph = new JsonSlurper().parse(overrideOutput.resolve('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/aaaaaaaa-reference-graph.json').toFile()) as Map
+assert overrideGraph.referenceScope == 'none'
+assert overrideGraph.exportedSessions == ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']
+
+Map configuredValidation = runCommand(['groovy', exporter.toString(), 'aaaaaaaa', '--validate-only'], cursorRoot)
+assert configuredValidation.exitCode == 0: configuredValidation.output
+
+Map partialConfig = runCommand(['groovy', exporter.toString(), 'config', '--reference-scope', 'relevant'], cursorRoot)
+assert partialConfig.exitCode == 0: partialConfig.output
+storedConfig = new JsonSlurper().parse(configPath.toFile()) as Map
+assert storedConfig.outputDir == configuredOutput.toString()
+assert storedConfig.referenceScope == 'relevant'
+String validConfigHash = sha256(configPath)
+Map invalidConfigUpdate = runCommand(['groovy', exporter.toString(), 'config', '--reference-scope', 'invalid'], cursorRoot)
+assert invalidConfigUpdate.exitCode == 2
+assert sha256(configPath) == validConfigHash
+
+Map unsetConfig = runCommand([
+    'groovy', exporter.toString(), 'config',
+    '--unset', 'outputDir',
+    '--unset', 'transcriptRoot',
+    '--unset', 'terminalRoot',
+    '--unset', 'agentToolRoot',
+    '--unset', 'workspace',
+    '--unset', 'referenceScope'
+], cursorRoot)
+assert unsetConfig.exitCode == 0: unsetConfig.output
+assert new JsonSlurper().parse(configPath.toFile()) == [version: 1]
+
+Files.writeString(configPath, '{invalid\n', StandardCharsets.UTF_8)
+if (supportsPosix(configPath)) {
+    Files.setPosixFilePermissions(configPath, PosixFilePermissions.fromString('rw-------'))
+}
+Map malformedConfig = runCommand(['groovy', exporter.toString(), 'config'], cursorRoot)
+assert malformedConfig.exitCode == 2
+Files.writeString(configPath, '{\n    "unknown": true,\n    "version": 1\n}\n', StandardCharsets.UTF_8)
+if (supportsPosix(configPath)) {
+    Files.setPosixFilePermissions(configPath, PosixFilePermissions.fromString('rw-------'))
+}
+Map unknownConfig = runCommand(['groovy', exporter.toString(), 'config'], cursorRoot)
+assert unknownConfig.exitCode == 2
+Files.writeString(configPath, '{\n    "version": 1\n}\n', StandardCharsets.UTF_8)
+if (supportsPosix(configPath)) {
+    Files.setPosixFilePermissions(configPath, PosixFilePermissions.fromString('rw-------'))
+}
+
 List<String> base = [
     'groovy',
     exporter.toString(),
@@ -115,7 +209,7 @@ assert Files.isRegularFile(bundle.resolve('aaaaaaaa-manifest.json'))
 assert Files.isRegularFile(bundle.resolve('session/aaaaaaaa-session.jsonl'))
 assert Files.isRegularFile(bundle.resolve('references/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/session/bbbbbbbb-session.jsonl'))
 assert Files.isRegularFile(bundle.resolve('references/cccccccc-cccc-4ccc-8ccc-cccccccccccc/session/cccccccc-session.jsonl'))
-assert Files.isRegularFile(bundle.resolve('references/99999999-9999-4999-8999-999999999999/session/99999999-session.jsonl'))
+assert !Files.exists(bundle.resolve('references/99999999-9999-4999-8999-999999999999'))
 assert Files.isRegularFile(bundle.resolve('aaaaaaaa-reference-evidence.jsonl'))
 assert Files.isRegularFile(bundle.resolve('aaaaaaaa-reference-summary.json'))
 assert Files.isRegularFile(bundle.resolve('aaaaaaaa-reference-index.json'))
@@ -125,7 +219,7 @@ assertSecureTree(output, bundle)
 Map graph = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-reference-graph.json').toFile()) as Map
 assert graph.schemaVersion == 2
 assert graph.referenceModelVersion == 1
-assert graph.referenceScope == 'recursive'
+assert graph.referenceScope == 'relevant'
 assert (graph.sessions as List).contains('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
 assert (graph.sessions as List).contains('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
 assert (graph.sessions as List).contains('99999999-9999-4999-8999-999999999999')
@@ -186,12 +280,12 @@ Map manifest = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-manifest.json').
 assert manifest.exporter == 'cursor-session-exporter.groovy'
 assert manifest.schemaVersion == 2
 assert manifest.referenceModelVersion == 1
-assert manifest.referenceScope == 'recursive'
+assert manifest.referenceScope == 'relevant'
 assert manifest.security.directoryMode == '0700'
 assert manifest.security.fileMode == '0600'
 Map restoreContext = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-restore-context.json').toFile()) as Map
 assert restoreContext.schemaVersion == 2
-assert restoreContext.references.scope == 'recursive'
+assert restoreContext.references.scope == 'relevant'
 assert (restoreContext.references.relevant as List).size() == 2
 Path stableTimeline = bundle.resolve('session/aaaaaaaa-session.jsonl')
 String firstTimelineHash = sha256(stableTimeline)
@@ -257,7 +351,8 @@ assert Files.isRegularFile(stableTimeline)
 assert sha256(stableTimeline) == preservedHash
 Files.writeString(rootTranscript, originalTranscript, StandardCharsets.UTF_8)
 
-['direct': ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '99999999-9999-4999-8999-999999999999'],
+['recursive': ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '99999999-9999-4999-8999-999999999999', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'],
+ 'direct': ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '99999999-9999-4999-8999-999999999999'],
  'relevant': ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'],
  'none': []].each { String scope, List<String> expectedReferences ->
     Path scopeOutput = temporary.resolve("output-${scope}")
