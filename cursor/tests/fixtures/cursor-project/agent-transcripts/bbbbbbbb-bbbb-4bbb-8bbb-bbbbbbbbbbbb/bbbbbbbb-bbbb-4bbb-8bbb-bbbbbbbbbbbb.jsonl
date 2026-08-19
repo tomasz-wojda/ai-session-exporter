@@ -1,2 +1,2 @@
-{"role":"user","message":{"content":[{"type":"text","text":"Referenced fixture points back to aaaaaaaa."}]}}
-{"role":"assistant","message":{"content":[{"type":"text","text":"Reference cycle recorded."}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"Referenced fixture points back to aaaaaaaa and includes cccccccc."}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Summary: Reference cycle recorded with cccccccc-cccc-4ccc-8ccc-cccccccccccc as supporting context."}]}}

@@ -40,6 +40,9 @@ class SessionExporter {
     static final int MAX_SNAPSHOT_BYTES = 25 * 1024 * 1024
     static final Set<PosixFilePermission> DIRECTORY_PERMISSIONS = PosixFilePermissions.fromString('rwx------')
     static final Set<PosixFilePermission> FILE_PERMISSIONS = PosixFilePermissions.fromString('rw-------')
+    static final Map<String, Integer> CONFIDENCE_RANK = [low: 1, medium: 2, high: 3]
+    static final Map<String, Integer> EVIDENCE_RANK = [tool_input: 1, shell_command: 2, file_content: 3, transcript_path: 4, summary: 5, message: 6, explicit_session_link: 7]
+    static final Set<String> REFERENCE_SCOPES = ['recursive', 'direct', 'relevant', 'none'] as Set
 
     Map options
     Path scriptDir
@@ -51,6 +54,7 @@ class SessionExporter {
     List<Map> completeness = []
     List<Map> relationshipEdges = []
     int reusedArtifacts = 0
+    Map activeGraph = [:]
 
     SessionExporter(Map options, Path scriptDir) {
         this.options = options
@@ -75,9 +79,9 @@ class SessionExporter {
 
     static Map parseArguments(String[] args) {
         if (!args || args[0] in ['--help', '-h']) {
-            throw new ExportFailure(2, 'usage: groovy cursor-session-exporter.groovy <session_id> [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--validate-only]')
+            throw new ExportFailure(2, 'usage: groovy cursor-session-exporter.groovy <session_id> [--reference-scope recursive|direct|relevant|none] [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--validate-only]')
         }
-        Map options = [sessionId: args[0], validateOnly: false]
+        Map options = [sessionId: args[0], validateOnly: false, referenceScope: 'recursive']
         Set<String> pathOptions = ['--output-dir', '--transcript-root', '--terminal-root', '--agent-tool-root', '--workspace'] as Set
         int index = 1
         while (index < args.length) {
@@ -85,6 +89,14 @@ class SessionExporter {
             if (argument == '--validate-only') {
                 options.validateOnly = true
                 index++
+                continue
+            }
+            if (argument == '--reference-scope') {
+                if (index + 1 >= args.length || !REFERENCE_SCOPES.contains(args[index + 1])) {
+                    throw new ExportFailure(2, 'reference scope must be recursive, direct, relevant, or none')
+                }
+                options.referenceScope = args[index + 1]
+                index += 2
                 continue
             }
             if (!pathOptions.contains(argument) || index + 1 >= args.length) {
@@ -124,6 +136,8 @@ class SessionExporter {
         configureEvidenceRoots(mainTranscript)
         terminalRecords = loadTerminalRecords(options.terminalRoot as Path)
         Map graph = discoverReferences(rootSession)
+        applyReferenceScope(graph, options.referenceScope as String)
+        activeGraph = graph
         Path staging = outputRoot.resolve(".${rootSession}.staging-${UUID.randomUUID()}")
         Path previous = outputRoot.resolve(".${rootSession}.previous-${UUID.randomUUID()}")
         deleteRecursively(staging)
@@ -131,7 +145,7 @@ class SessionExporter {
         try {
             Map rootResult = exportOneSession(rootSession, staging, false, destination)
             Path referenceRoot = staging.resolve('references')
-            ((graph.sessions as List<String>).findAll { it != rootSession }).each { String referenceId ->
+            ((graph.exportedSessions as List<String>).findAll { it != rootSession }).each { String referenceId ->
                 exportOneSession(referenceId, referenceRoot.resolve(referenceId), true, destination.resolve('references').resolve(referenceId))
             }
             if (Files.exists(referenceRoot) && isDirectoryEmpty(referenceRoot)) {
@@ -162,7 +176,7 @@ class SessionExporter {
                 throw moveFailure
             }
             println("Exported ${rootSession} to ${destination}")
-            println("Sessions: ${(graph.sessions as List).size()}, references: ${(graph.sessions as List).size() - 1}, reused artifacts: ${reusedArtifacts}")
+            println("References: detected=${(graph.sessions as List).size() - 1}, direct=${graph.summary.direct}, indirect=${graph.summary.indirect}, exported=${(graph.exportedSessions as List).size() - 1}, omitted=${(graph.omittedSessions as List).size()}, cycles=${(graph.cycleGroups as List).size()}, reused artifacts: ${reusedArtifacts}")
         } catch (ExportFailure failure) {
             deleteRecursively(staging)
             throw failure
@@ -282,50 +296,344 @@ class SessionExporter {
         List<String> queue = [rootSession]
         Set<String> visited = new LinkedHashSet<>()
         List<Map> unresolved = []
+        Map<String, List<Map>> evidenceByEdge = [:].withDefault { [] }
         while (!queue.isEmpty()) {
             String current = queue.remove(0)
             if (!visited.add(current)) {
                 continue
             }
-            Set<String> discovered = discoverDirectReferences(current, unresolved)
-            discovered.each { String reference ->
-                relationshipEdges << [from: current, to: reference, type: 'referenced']
+            Map<String, List<Map>> discovered = discoverDirectReferences(current, unresolved)
+            discovered.each { String reference, List<Map> evidence ->
+                evidenceByEdge["${current}|${reference}"].addAll(evidence)
                 if (!visited.contains(reference)) {
                     queue << reference
                 }
             }
         }
+        List<Map> evidence = evidenceByEdge.values().flatten().sort { a, b -> "${a.from}:${a.to}:${a.sourceLine}:${a.contentIndex}:${a.evidenceId}" <=> "${b.from}:${b.to}:${b.sourceLine}:${b.contentIndex}:${b.evidenceId}" }
+        List<Map> edges = evidenceByEdge.collect { String key, List<Map> occurrences ->
+            List<String> parts = key.split('\\|', 2) as List<String>
+            aggregateReferenceEdge(rootSession, parts[0], parts[1], occurrences)
+        }.sort { a, b -> "${a.from}:${a.to}" <=> "${b.from}:${b.to}" }
+        Map<String, Integer> depths = [(rootSession): 0]
+        Map<String, String> parents = [:]
+        List<String> depthQueue = [rootSession]
+        while (!depthQueue.isEmpty()) {
+            String source = depthQueue.remove(0)
+            edges.findAll { it.from == source }.sort { it.to }.each { Map edge ->
+                String target = edge.to
+                if (!depths.containsKey(target)) {
+                    depths[target] = depths[source] + 1
+                    parents[target] = source
+                    depthQueue << target
+                }
+            }
+        }
+        List<List<String>> cycleGroups = findCycleGroups(visited.toList(), edges)
+        Map<String, Integer> cycleBySession = [:]
+        cycleGroups.eachWithIndex { List<String> group, int index -> group.each { cycleBySession[it] = index + 1 } }
+        edges.each { Map edge ->
+            edge.cyclic = cycleBySession[edge.from] != null && cycleBySession[edge.from] == cycleBySession[edge.to]
+        }
+        List<Map> nodes = visited.collect { String sessionId ->
+            List<String> vector = shortestVector(rootSession, sessionId, parents)
+            List<Map> pathEdges = []
+            for (int index = 0; index + 1 < vector.size(); index++) {
+                Map edge = edges.find { it.from == vector[index] && it.to == vector[index + 1] }
+                if (edge) pathEdges << edge
+            }
+            String baseRelationship = sessionId == rootSession ? 'root' : (depths[sessionId] == 1 ? 'direct' : 'indirect')
+            String confidence = pathEdges.isEmpty() ? 'high' : weakestConfidence(pathEdges.collect { it.confidence as String })
+            String relevance = classifyRelevance(baseRelationship, confidence, pathEdges)
+            [
+                sessionId: sessionId,
+                prefix: sessionId.take(8),
+                relationship: sessionId != rootSession && cycleBySession.containsKey(sessionId) ? 'cyclic' : baseRelationship,
+                baseRelationship: baseRelationship,
+                depth: depths[sessionId],
+                shortestVector: vector,
+                topic: topicForSession(sessionId),
+                confidence: confidence,
+                relevance: relevance,
+                cycleGroup: cycleBySession[sessionId],
+                exported: false
+            ].findAll { it.value != null }
+        }.sort { a, b ->
+            int depthComparison = (a.depth as int) <=> (b.depth as int)
+            depthComparison != 0 ? depthComparison : a.sessionId <=> b.sessionId
+        }
+        relationshipEdges = edges
+        Map summary = buildReferenceSummary(rootSession, nodes, edges, cycleGroups)
         [
+            schemaVersion: 2,
+            referenceModelVersion: 1,
             root: rootSession,
             sessions: visited.toList(),
-            edges: relationshipEdges.sort { a, b -> "${a.from}:${a.to}" <=> "${b.from}:${b.to}" },
-            unresolved: unresolved
+            nodes: nodes,
+            edges: edges,
+            evidence: evidence,
+            cycleGroups: cycleGroups,
+            summary: summary,
+            unresolved: unresolved.sort { a, b -> canonicalJson(a) <=> canonicalJson(b) }
         ]
     }
 
-    Set<String> discoverDirectReferences(String sessionId, List<Map> unresolved) {
-        Set<String> references = new TreeSet<>()
-        parseTranscript(sessionId).each { Map record ->
-            String text = canonicalJson(record.raw)
-            def uuidMatcher = UUID_PATTERN.matcher(text)
-            while (uuidMatcher.find()) {
-                String candidate = uuidMatcher.group(1).toLowerCase()
-                if (candidate != sessionId && transcriptIndex.containsKey(candidate)) {
-                    references << candidate
-                }
-            }
-            def prefixMatcher = PREFIX_PATTERN.matcher(text)
-            while (prefixMatcher.find()) {
-                String prefix = prefixMatcher.group(1).toLowerCase()
-                List<String> matches = transcriptIndex.keySet().findAll { it.startsWith(prefix) }.toList()
-                if (matches.size() == 1 && matches.first() != sessionId) {
-                    references << matches.first()
-                } else if (matches.size() > 1) {
-                    unresolved << [sessionId: sessionId, prefix: prefix, reason: 'ambiguous_reference']
+    Map<String, List<Map>> discoverDirectReferences(String sessionId, List<Map> unresolved) {
+        Map<String, List<Map>> references = [:].withDefault { [] }
+        List<Map> records = parseTranscript(sessionId)
+        Map<String, String> eventIds = normalizeEvents(sessionId, records).timeline.collectEntries { Map event ->
+            ["${event.sourceLine}:${event.contentIndex}", event.eventId.toString()]
+        }
+        records.each { Map record ->
+            Map raw = record.raw as Map
+            String role = raw.role?.toString() ?: 'unknown'
+            List content = raw.message instanceof Map && raw.message.content instanceof List ? raw.message.content as List : []
+            content.eachWithIndex { Object item, int contentIndex ->
+                Map contentItem = item instanceof Map ? item as Map : [type: 'value', value: item]
+                String eventId = eventIds["${record.lineNumber}:${contentIndex}"]
+                if (contentItem.type == 'text') {
+                    String category = isSummaryContent(contentItem) ? 'summary' : 'message'
+                    scanReferenceText(sessionId, contentItem.text?.toString() ?: '', category, role, null, 'text', record, contentIndex, eventId, references, unresolved)
+                } else if (contentItem.type == 'tool_use') {
+                    String tool = normalizeToolName(contentItem.name?.toString())
+                    Object input = contentItem.input
+                    collectStringLeaves(input, 'input').each { Map leaf ->
+                        String category
+                        if (leaf.value.contains('/agent-transcripts/') || leaf.value.contains('agent-transcripts/')) {
+                            category = 'transcript_path'
+                        } else if (tool == 'shell' && leaf.path.endsWith('.command')) {
+                            category = 'shell_command'
+                        } else if (FILE_TOOLS.contains(tool) && (tool == 'applypatch' || leaf.path ==~ /(?i).*(contents|content|old_string|new_string|patch).*/)) {
+                            category = 'file_content'
+                        } else {
+                            category = 'tool_input'
+                        }
+                        scanReferenceText(sessionId, leaf.value, category, role, contentItem.name?.toString(), leaf.path, record, contentIndex, eventId, references, unresolved)
+                    }
                 }
             }
         }
         references
+    }
+
+    void scanReferenceText(String sessionId, String text, String baseCategory, String role, String tool, String fieldPath, Map record, int contentIndex, String eventId, Map<String, List<Map>> references, List<Map> unresolved) {
+        def uuidMatcher = UUID_PATTERN.matcher(text)
+        while (uuidMatcher.find()) {
+            String identifier = uuidMatcher.group(1)
+            String category = baseCategory == 'message' ? 'explicit_session_link' : baseCategory
+            addReferenceOccurrence(sessionId, identifier, 'full_uuid', category, role, tool, fieldPath, text, record, contentIndex, eventId, references, unresolved)
+        }
+        def prefixMatcher = PREFIX_PATTERN.matcher(text)
+        while (prefixMatcher.find()) {
+            addReferenceOccurrence(sessionId, prefixMatcher.group(1), 'prefix', baseCategory, role, tool, fieldPath, text, record, contentIndex, eventId, references, unresolved)
+        }
+    }
+
+    void addReferenceOccurrence(String sessionId, String identifier, String identifierForm, String category, String role, String tool, String fieldPath, String text, Map record, int contentIndex, String eventId, Map<String, List<Map>> references, List<Map> unresolved) {
+        List<String> matches = identifierForm == 'full_uuid'
+            ? (transcriptIndex.containsKey(identifier.toLowerCase()) ? [identifier.toLowerCase()] : [])
+            : transcriptIndex.keySet().findAll { it.startsWith(identifier.toLowerCase()) }.toList()
+        if (matches.size() > 1) {
+            unresolved << [
+                sessionId: sessionId,
+                identifier: identifier,
+                identifierForm: identifierForm,
+                relationship: 'unresolved',
+                confidence: 'unknown',
+                relevance: 'unknown',
+                reason: 'ambiguous_reference',
+                sourceLine: record.lineNumber,
+                contentIndex: contentIndex,
+                snippet: referenceSnippet(text, identifier)
+            ]
+            return
+        }
+        if (matches.size() != 1 || matches.first() == sessionId) {
+            return
+        }
+        String target = matches.first()
+        Map evidence = [
+            from: sessionId,
+            to: target,
+            identifier: identifier,
+            identifierForm: identifierForm,
+            evidenceType: category,
+            confidence: confidenceFor(category),
+            role: role,
+            tool: tool,
+            fieldPath: fieldPath,
+            sourcePath: record.sourcePath,
+            sourceLine: record.lineNumber,
+            contentIndex: contentIndex,
+            eventId: eventId,
+            snippet: referenceSnippet(text, identifier)
+        ].findAll { it.value != null }
+        evidence.evidenceId = stableId(evidence)
+        references[target] << evidence
+    }
+
+    List<Map> collectStringLeaves(Object value, String path) {
+        List<Map> leaves = []
+        if (value instanceof Map) {
+            value.each { key, item -> leaves.addAll(collectStringLeaves(item, "${path}.${key}")) }
+        } else if (value instanceof Collection) {
+            value.eachWithIndex { item, index -> leaves.addAll(collectStringLeaves(item, "${path}[${index}]")) }
+        } else if (value != null) {
+            leaves << [path: path, value: value.toString()]
+        }
+        leaves
+    }
+
+    Map aggregateReferenceEdge(String rootSession, String from, String to, List<Map> occurrences) {
+        List<Map> sorted = occurrences.sort { a, b ->
+            int confidenceComparison = (CONFIDENCE_RANK[b.confidence] ?: 0) <=> (CONFIDENCE_RANK[a.confidence] ?: 0)
+            if (confidenceComparison != 0) return confidenceComparison
+            int identifierComparison = (b.identifierForm == 'full_uuid' ? 1 : 0) <=> (a.identifierForm == 'full_uuid' ? 1 : 0)
+            if (identifierComparison != 0) return identifierComparison
+            int evidenceComparison = (EVIDENCE_RANK[b.evidenceType] ?: 0) <=> (EVIDENCE_RANK[a.evidenceType] ?: 0)
+            if (evidenceComparison != 0) return evidenceComparison
+            int lineComparison = (a.sourceLine as int) <=> (b.sourceLine as int)
+            if (lineComparison != 0) return lineComparison
+            int indexComparison = (a.contentIndex as int) <=> (b.contentIndex as int)
+            indexComparison != 0 ? indexComparison : a.evidenceId <=> b.evidenceId
+        }
+        Map strongest = sorted.first()
+        [
+            from: from,
+            to: to,
+            type: 'referenced',
+            relationship: from == rootSession ? 'direct' : 'indirect',
+            confidence: strongest.confidence,
+            strongestEvidenceType: strongest.evidenceType,
+            strongestEvidenceId: strongest.evidenceId,
+            identifierForm: strongest.identifierForm,
+            sourceLine: strongest.sourceLine,
+            contentIndex: strongest.contentIndex,
+            eventId: strongest.eventId,
+            snippet: strongest.snippet,
+            evidenceTypes: occurrences.collect { it.evidenceType }.unique().sort(),
+            identifierForms: occurrences.collect { it.identifierForm }.unique().sort(),
+            evidenceCount: occurrences.size(),
+            evidenceIds: occurrences.collect { it.evidenceId }.unique().sort()
+        ]
+    }
+
+    String confidenceFor(String category) {
+        category == 'explicit_session_link' ? 'high' : (category in ['message', 'summary'] ? 'medium' : 'low')
+    }
+
+    String weakestConfidence(List<String> values) {
+        values.min { CONFIDENCE_RANK[it] ?: 0 } ?: 'low'
+    }
+
+    String classifyRelevance(String relationship, String confidence, List<Map> pathEdges) {
+        if (relationship == 'root') return 'primary'
+        if (relationship == 'direct' && confidence == 'high' && pathEdges.last()?.strongestEvidenceType in ['explicit_session_link', 'message']) return 'primary'
+        if (!pathEdges.isEmpty() && pathEdges.every { it.confidence in ['high', 'medium'] }) return 'supporting'
+        if (!pathEdges.isEmpty()) return 'incidental'
+        'unknown'
+    }
+
+    String topicForSession(String sessionId) {
+        for (Map record : parseTranscript(sessionId)) {
+            Map raw = record.raw as Map
+            if (raw.role == 'user' && raw.message instanceof Map && raw.message.content instanceof List) {
+                Map text = (raw.message.content as List).find { it instanceof Map && it.type == 'text' } as Map
+                if (text?.text) {
+                    String topic = text.text.toString().replaceAll('(?s)<timestamp>.*?</timestamp>', ' ').replaceAll('(?s)</?user_query>', ' ').replaceAll('<[^>]+>', ' ').replaceAll('\\s+', ' ').trim()
+                    if (topic) return topic.take(160)
+                }
+            }
+        }
+        sessionId.take(8)
+    }
+
+    String referenceSnippet(String text, String identifier) {
+        String normalized = text.replaceAll('\\s+', ' ').trim()
+        int index = normalized.toLowerCase().indexOf(identifier.toLowerCase())
+        if (index < 0) return normalized.take(180)
+        int start = Math.max(0, index - 60)
+        int end = Math.min(normalized.length(), index + identifier.length() + 80)
+        normalized.substring(start, end)
+    }
+
+    List<String> shortestVector(String rootSession, String sessionId, Map<String, String> parents) {
+        List<String> vector = []
+        String current = sessionId
+        while (current != null) {
+            vector.add(0, current)
+            if (current == rootSession) break
+            current = parents[current]
+        }
+        vector
+    }
+
+    List<List<String>> findCycleGroups(List<String> sessions, List<Map> edges) {
+        Map<String, Set<String>> adjacency = sessions.collectEntries { [(it): new TreeSet<String>()] }
+        edges.each { adjacency[it.from] << it.to }
+        Set<String> remaining = new TreeSet<>(sessions)
+        List<List<String>> groups = []
+        while (!remaining.isEmpty()) {
+            String node = remaining.first()
+            List<String> component = remaining.findAll { String candidate ->
+                reachable(node, candidate, adjacency) && reachable(candidate, node, adjacency)
+            }.toList().sort()
+            boolean selfCycle = adjacency[node].contains(node)
+            if (component.size() > 1 || selfCycle) groups << component
+            remaining.removeAll(component)
+        }
+        groups.sort { a, b -> a.first() <=> b.first() }
+    }
+
+    boolean reachable(String source, String target, Map<String, Set<String>> adjacency) {
+        if (source == target) return true
+        Set<String> visited = [source] as Set
+        List<String> queue = [source]
+        while (!queue.isEmpty()) {
+            String current = queue.remove(0)
+            for (String next : adjacency[current] ?: []) {
+                if (next == target) return true
+                if (visited.add(next)) queue << next
+            }
+        }
+        false
+    }
+
+    Map buildReferenceSummary(String rootSession, List<Map> nodes, List<Map> edges, List<List<String>> cycleGroups) {
+        Map relevanceCounts = nodes.findAll { it.sessionId != rootSession }.countBy { it.relevance }
+        Map confidenceCounts = nodes.findAll { it.sessionId != rootSession }.countBy { it.confidence }
+        [
+            root: rootSession,
+            detected: nodes.size() - 1,
+            uniqueReferences: nodes.size() - 1,
+            direct: nodes.count { it.baseRelationship == 'direct' },
+            directReferences: nodes.count { it.baseRelationship == 'direct' },
+            indirect: nodes.count { it.baseRelationship == 'indirect' },
+            indirectReferences: nodes.count { it.baseRelationship == 'indirect' },
+            edges: edges.size(),
+            edgeCount: edges.size(),
+            cycles: cycleGroups.size(),
+            cycleCount: cycleGroups.size(),
+            relevance: new TreeMap(relevanceCounts),
+            confidence: new TreeMap(confidenceCounts)
+        ]
+    }
+
+    void applyReferenceScope(Map graph, String scope) {
+        List<Map> nodes = graph.nodes as List<Map>
+        Set<String> selected = nodes.findAll { Map node ->
+            node.baseRelationship == 'root' ||
+                scope == 'recursive' ||
+                (scope == 'direct' && node.depth == 1) ||
+                (scope == 'relevant' && node.relevance in ['primary', 'supporting'])
+        }.collect { it.sessionId } as Set<String>
+        if (scope == 'none') selected = [graph.root] as Set<String>
+        nodes.each { it.exported = selected.contains(it.sessionId) }
+        graph.referenceScope = scope
+        graph.exportedSessions = (graph.sessions as List).findAll { selected.contains(it) }
+        graph.omittedSessions = (graph.sessions as List).findAll { !selected.contains(it) }
+        graph.summary.exported = (graph.exportedSessions as List).size() - 1
+        graph.summary.omitted = (graph.omittedSessions as List).size()
     }
 
     Map exportOneSession(String sessionId, Path destination, boolean referenced, Path existingDestination) {
@@ -375,11 +683,13 @@ class SessionExporter {
         Map restore = buildRestoreContext(sessionId, normalized.timeline as List, checkpoint, workspace, scripts)
         writeJson(destination.resolve("${prefix}-restore-context.json"), restore)
         Map manifest = [
-            schemaVersion: 1,
+            schemaVersion: 2,
             exporter: 'cursor-session-exporter.groovy',
             sessionId: sessionId,
             prefix: prefix,
             referenced: referenced,
+            referenceModelVersion: 1,
+            referenceScope: options.referenceScope,
             sourceTranscript: transcriptIndex[sessionId].toString(),
             exportedAt: Instant.now().toString(),
             security: securityMetadata(destination),
@@ -457,7 +767,11 @@ class SessionExporter {
 
     boolean isSummaryContent(Map contentItem) {
         String text = contentItem.text?.toString()?.toLowerCase() ?: ''
-        text.contains('<summary_content>') || text.contains('conversation was summarized') || text.startsWith('summary:')
+        text.contains('<summary_content>') ||
+            text.contains('conversation was summarized') ||
+            text.startsWith('summary:') ||
+            text.startsWith('|') ||
+            text.contains('\n|')
     }
 
     Map exportScripts(String sessionId, List<Map> toolCalls, Path destination, Path existingDestination) {
@@ -895,13 +1209,27 @@ class SessionExporter {
     Map buildRestoreContext(String sessionId, List<Map> timeline, Map checkpoint, Map workspace, Map scripts) {
         List<Map> recent = checkpoint.recentConversation as List<Map>
         String conversation = recent.collect { "${it.role}: ${it.text ?: ''}" }.join('\n\n')
-        String bootstrap = "Restore Cursor session ${sessionId}. Use the supplied manifest, timeline, scripts, commands, artifacts, workspace metadata, and referenced sessions as authoritative evidence. Do not claim unavailable command results. Continue from this checkpoint:\n\n${conversation}"
+        List<Map> direct = (activeGraph.nodes ?: []).findAll { it.baseRelationship == 'direct' }
+        List<Map> relevant = (activeGraph.nodes ?: []).findAll { it.relevance in ['primary', 'supporting'] && it.sessionId != activeGraph.root }
+        String referenceText = relevant.collect { "${(it.shortestVector as List).collect { value -> value.take(8) }.join(' -> ')}: ${it.topic}" }.join('\n')
+        String graphPathPrefix = sessionId == activeGraph.root ? '' : '../../'
+        String bootstrap = "Restore Cursor session ${sessionId}. Use the supplied manifest, timeline, scripts, commands, artifacts, workspace metadata, and referenced sessions as authoritative evidence. Prioritize primary and supporting references; treat incidental references as forensic evidence only. Do not claim unavailable command results.\n\nRelevant references:\n${referenceText}\n\nContinue from this checkpoint:\n\n${conversation}"
         [
-            schemaVersion: 1,
+            schemaVersion: 2,
             sessionId: sessionId,
             sourceTranscript: transcriptIndex[sessionId].toString(),
             workspace: workspace,
             requiredFiles: scripts.snapshots ?: [],
+            references: [
+                modelVersion: 1,
+                scope: options.referenceScope,
+                completeGraphPath: "${graphPathPrefix}${activeGraph.root.take(8)}-reference-graph.json",
+                relevantGraphPath: "${graphPathPrefix}${activeGraph.root.take(8)}-relevant-reference-graph.json",
+                evidencePath: "${graphPathPrefix}${activeGraph.root.take(8)}-reference-evidence.jsonl",
+                summary: activeGraph.summary,
+                direct: direct,
+                relevant: relevant
+            ],
             checkpoint: checkpoint,
             bootstrapPrompt: bootstrap
         ]
@@ -909,7 +1237,13 @@ class SessionExporter {
 
     void writeRootRelationshipFiles(Path staging, String rootSession, Map graph, Map rootResult) {
         String prefix = rootSession.take(8)
-        writeJson(staging.resolve("${prefix}-reference-graph.json"), graph)
+        Map completeGraph = new LinkedHashMap(graph)
+        List<Map> evidence = completeGraph.remove('evidence') as List<Map>
+        writeJson(staging.resolve("${prefix}-reference-graph.json"), completeGraph)
+        writeJsonLines(staging.resolve("${prefix}-reference-evidence.jsonl"), evidence)
+        writeJson(staging.resolve("${prefix}-reference-summary.json"), graph.summary)
+        writeJson(staging.resolve("${prefix}-reference-index.json"), buildReferenceIndex(graph))
+        writeJson(staging.resolve("${prefix}-relevant-reference-graph.json"), buildRelevantReferenceGraph(graph))
         Path integrityDir = staging.resolve('integrity')
         secureDirectories(integrityDir)
         List<Map> issues = (completeness + (graph.unresolved as List)).sort { a, b -> canonicalJson(a) <=> canonicalJson(b) }
@@ -919,11 +1253,64 @@ class SessionExporter {
             rootSession: rootSession,
             sessionCount: (graph.sessions as List).size(),
             referenceCount: (graph.sessions as List).size() - 1,
+            referenceScope: graph.referenceScope,
+            directReferences: graph.summary.direct,
+            indirectReferences: graph.summary.indirect,
+            exportedReferences: graph.summary.exported,
+            omittedReferences: graph.summary.omitted,
+            cycleGroups: (graph.cycleGroups as List).size(),
+            relevance: graph.summary.relevance,
             completenessIssues: issues.size(),
             reusedArtifacts: reusedArtifacts,
             security: securityMetadata(staging),
             generatedAt: Instant.now().toString()
         ])
+    }
+
+    Map buildReferenceIndex(Map graph) {
+        List<Map> entries = (graph.nodes as List<Map>).findAll { it.sessionId != graph.root }.collect { Map node ->
+            Map edge = (graph.edges as List<Map>).find { it.to == node.sessionId && (node.shortestVector as List).contains(it.from) }
+            [
+                sessionId: node.sessionId,
+                prefix: node.prefix,
+                relationship: node.baseRelationship,
+                depth: node.depth,
+                vector: (node.shortestVector as List).collect { it.take(8) },
+                vectorText: (node.shortestVector as List).collect { it.take(8) }.join(' -> '),
+                topic: node.topic,
+                evidenceType: edge?.strongestEvidenceType,
+                confidence: node.confidence,
+                relevance: node.relevance,
+                cyclic: node.relationship == 'cyclic',
+                exported: node.exported
+            ]
+        }
+        [
+            root: graph.root,
+            scope: graph.referenceScope,
+            direct: entries.findAll { it.relationship == 'direct' },
+            indirect: entries.findAll { it.relationship == 'indirect' },
+            summary: graph.summary
+        ]
+    }
+
+    Map buildRelevantReferenceGraph(Map graph) {
+        Set<String> relevantIds = (graph.nodes as List<Map>).findAll {
+            it.sessionId == graph.root || it.relevance in ['primary', 'supporting']
+        }.collect { it.sessionId } as Set<String>
+        [
+            schemaVersion: 2,
+            referenceModelVersion: 1,
+            root: graph.root,
+            sessions: (graph.sessions as List).findAll { relevantIds.contains(it) },
+            nodes: (graph.nodes as List).findAll { relevantIds.contains(it.sessionId) },
+            edges: (graph.edges as List).findAll { relevantIds.contains(it.from) && relevantIds.contains(it.to) },
+            summary: [
+                references: relevantIds.size() - 1,
+                primary: (graph.nodes as List).count { it.sessionId != graph.root && it.relevance == 'primary' },
+                supporting: (graph.nodes as List).count { it.relevance == 'supporting' }
+            ]
+        ]
     }
 
     void writeIntegrity(Path staging) {
@@ -1034,16 +1421,40 @@ class SessionExporter {
         }
         List<Path> graphFiles = []
         Files.walk(root).withCloseable { stream ->
-            stream.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith('-reference-graph.json') }.forEach { graphFiles << it }
+            stream.filter {
+                Files.isRegularFile(it) &&
+                    it.fileName.toString().endsWith('-reference-graph.json') &&
+                    !it.fileName.toString().endsWith('-relevant-reference-graph.json')
+            }.forEach { graphFiles << it }
         }
         graphFiles.each { Path graphPath ->
             Map graph = new JsonSlurper().parse(graphPath.toFile()) as Map
             String graphRoot = graph.root?.toString()
-            (graph.sessions instanceof List ? graph.sessions : []).each { Object rawSession ->
+            List exportedSessions = graph.exportedSessions instanceof List ? graph.exportedSessions as List : (graph.sessions instanceof List ? graph.sessions as List : [])
+            exportedSessions.each { Object rawSession ->
                 String sessionId = rawSession.toString()
                 Path expected = sessionId == graphRoot ? root : root.resolve('references').resolve(sessionId)
                 if (!Files.isDirectory(expected)) {
                     errors << "reference target missing: ${sessionId}"
+                }
+            }
+            (graph.omittedSessions instanceof List ? graph.omittedSessions : []).each { Object rawSession ->
+                Path unexpected = root.resolve('references').resolve(rawSession.toString())
+                if (Files.exists(unexpected)) {
+                    errors << "omitted reference was exported: ${rawSession}"
+                }
+            }
+            (graph.nodes instanceof List ? graph.nodes : []).each { Object rawNode ->
+                Map node = rawNode as Map
+                ['sessionId', 'relationship', 'baseRelationship', 'depth', 'shortestVector', 'confidence', 'relevance', 'exported'].each { String field ->
+                    if (!node.containsKey(field) || node[field] == null) {
+                        errors << "reference node missing ${field}: ${node.sessionId}"
+                    }
+                }
+                if (node.shortestVector instanceof List && !(node.shortestVector as List).isEmpty()) {
+                    if ((node.shortestVector as List).first() != graphRoot || (node.shortestVector as List).last() != node.sessionId) {
+                        errors << "invalid shortest vector: ${node.sessionId}"
+                    }
                 }
             }
         }

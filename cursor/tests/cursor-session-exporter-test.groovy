@@ -114,19 +114,62 @@ assert Files.isDirectory(bundle)
 assert Files.isRegularFile(bundle.resolve('aaaaaaaa-manifest.json'))
 assert Files.isRegularFile(bundle.resolve('session/aaaaaaaa-session.jsonl'))
 assert Files.isRegularFile(bundle.resolve('references/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/session/bbbbbbbb-session.jsonl'))
+assert Files.isRegularFile(bundle.resolve('references/cccccccc-cccc-4ccc-8ccc-cccccccccccc/session/cccccccc-session.jsonl'))
+assert Files.isRegularFile(bundle.resolve('references/99999999-9999-4999-8999-999999999999/session/99999999-session.jsonl'))
+assert Files.isRegularFile(bundle.resolve('aaaaaaaa-reference-evidence.jsonl'))
+assert Files.isRegularFile(bundle.resolve('aaaaaaaa-reference-summary.json'))
+assert Files.isRegularFile(bundle.resolve('aaaaaaaa-reference-index.json'))
+assert Files.isRegularFile(bundle.resolve('aaaaaaaa-relevant-reference-graph.json'))
 assertSecureTree(output, bundle)
 
 Map graph = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-reference-graph.json').toFile()) as Map
+assert graph.schemaVersion == 2
+assert graph.referenceModelVersion == 1
+assert graph.referenceScope == 'recursive'
 assert (graph.sessions as List).contains('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
-assert (graph.edges as List).any { it.from == 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' && it.to == 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }
+assert (graph.sessions as List).contains('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+assert (graph.sessions as List).contains('99999999-9999-4999-8999-999999999999')
+Map directEdge = (graph.edges as List).find { it.from == 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' && it.to == 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } as Map
+assert directEdge.confidence == 'high'
+assert directEdge.strongestEvidenceType == 'explicit_session_link'
+assert directEdge.evidenceCount == 5
+assert (directEdge.evidenceTypes as List).containsAll(['explicit_session_link', 'message', 'tool_input', 'shell_command', 'file_content'])
 assert (graph.edges as List).any { it.from == 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && it.to == 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }
+Map indirectEdge = (graph.edges as List).find { it.from == 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' && it.to == 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' } as Map
+assert indirectEdge.evidenceCount == 2
+assert indirectEdge.strongestEvidenceType == 'summary'
+assert indirectEdge.identifierForm == 'full_uuid'
+assert (graph.cycleGroups as List).any { (it as List).containsAll(['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']) }
+Map directNode = (graph.nodes as List).find { it.sessionId == 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } as Map
+assert directNode.baseRelationship == 'direct'
+assert directNode.relationship == 'cyclic'
+assert directNode.depth == 1
+assert directNode.relevance == 'primary'
+assert directNode.shortestVector == ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']
+Map indirectNode = (graph.nodes as List).find { it.sessionId == 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' } as Map
+assert indirectNode.baseRelationship == 'indirect'
+assert indirectNode.depth == 2
+assert indirectNode.confidence == 'medium'
+assert indirectNode.relevance == 'supporting'
+Map incidentalNode = (graph.nodes as List).find { it.sessionId == '99999999-9999-4999-8999-999999999999' } as Map
+assert incidentalNode.baseRelationship == 'direct'
+assert incidentalNode.confidence == 'low'
+assert incidentalNode.relevance == 'incidental'
+assert (graph.unresolved as List).any { it.identifier == 'dddddddd' && it.reason == 'ambiguous_reference' }
+List<Map> referenceEvidence = readJsonLines(bundle.resolve('aaaaaaaa-reference-evidence.jsonl'))
+assert referenceEvidence.count { it.from == 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' && it.to == 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } == 5
+assert referenceEvidence.any { it.to == '99999999-9999-4999-8999-999999999999' && it.evidenceType == 'transcript_path' }
+assert referenceEvidence.any { it.to == 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' && it.evidenceType == 'summary' }
+Map referenceIndex = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-reference-index.json').toFile()) as Map
+assert (referenceIndex.direct as List).any { it.vectorText == 'aaaaaaaa -> bbbbbbbb' }
+assert (referenceIndex.indirect as List).any { it.vectorText == 'aaaaaaaa -> bbbbbbbb -> cccccccc' }
 
 List<Map> commands = readJsonLines(bundle.resolve('commands/aaaaaaaa-commands.jsonl'))
 assert commands.size() == 4
 assert commands.find { it.command == 'echo ok' }.correlation == 'exact'
 assert commands.find { it.command == 'echo inferred' }.correlation == 'inferred'
 assert commands.find { it.command == 'false' }.exitCode == 1
-assert commands.find { it.command == 'echo missing' }.correlation == 'unmatched'
+assert commands.find { it.command == 'echo missing bbbbbbbb' }.correlation == 'unmatched'
 
 Map scriptIndex = new JsonSlurper().parse(bundle.resolve('scripts/aaaaaaaa-script-index.json').toFile()) as Map
 assert scriptIndex.operations == 2
@@ -141,15 +184,25 @@ Map validation = new JsonSlurper().parse(bundle.resolve('integrity/aaaaaaaa-vali
 assert validation.valid
 Map manifest = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-manifest.json').toFile()) as Map
 assert manifest.exporter == 'cursor-session-exporter.groovy'
+assert manifest.schemaVersion == 2
+assert manifest.referenceModelVersion == 1
+assert manifest.referenceScope == 'recursive'
 assert manifest.security.directoryMode == '0700'
 assert manifest.security.fileMode == '0600'
+Map restoreContext = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-restore-context.json').toFile()) as Map
+assert restoreContext.schemaVersion == 2
+assert restoreContext.references.scope == 'recursive'
+assert (restoreContext.references.relevant as List).size() == 2
 Path stableTimeline = bundle.resolve('session/aaaaaaaa-session.jsonl')
 String firstTimelineHash = sha256(stableTimeline)
+Path stableGraph = bundle.resolve('aaaaaaaa-reference-graph.json')
+String firstGraphHash = sha256(stableGraph)
 
 Map second = runCommand(base, cursorRoot)
 assert second.exitCode == 0: second.output
 assert second.output.contains('reused artifacts:')
 assert sha256(stableTimeline) == firstTimelineHash
+assert sha256(stableGraph) == firstGraphHash
 
 Map validateOnly = runCommand(base + ['--validate-only'], cursorRoot)
 assert validateOnly.exitCode == 0: validateOnly.output
@@ -203,5 +256,30 @@ assert failedReplacement.exitCode == 6
 assert Files.isRegularFile(stableTimeline)
 assert sha256(stableTimeline) == preservedHash
 Files.writeString(rootTranscript, originalTranscript, StandardCharsets.UTF_8)
+
+['direct': ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '99999999-9999-4999-8999-999999999999'],
+ 'relevant': ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'],
+ 'none': []].each { String scope, List<String> expectedReferences ->
+    Path scopeOutput = temporary.resolve("output-${scope}")
+    List<String> scopedCommand = new ArrayList<>(base)
+    scopedCommand[scopedCommand.indexOf(output.toString())] = scopeOutput.toString()
+    scopedCommand.addAll(['--reference-scope', scope])
+    Map scoped = runCommand(scopedCommand, cursorRoot)
+    assert scoped.exitCode == 0: scoped.output
+    Path scopedBundle = scopeOutput.resolve('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    Map scopedGraph = new JsonSlurper().parse(scopedBundle.resolve('aaaaaaaa-reference-graph.json').toFile()) as Map
+    assert scopedGraph.referenceScope == scope
+    assert scopedGraph.exportedSessions == ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'] + expectedReferences
+    expectedReferences.each { String sessionId ->
+        assert Files.isDirectory(scopedBundle.resolve('references').resolve(sessionId))
+    }
+    ((scopedGraph.omittedSessions ?: []) as List).each { String sessionId ->
+        assert !Files.exists(scopedBundle.resolve('references').resolve(sessionId))
+    }
+    assertSecureTree(scopeOutput, scopedBundle)
+}
+
+Map invalidScope = runCommand(base + ['--reference-scope', 'invalid'], cursorRoot)
+assert invalidScope.exitCode == 2
 
 println('cursor-session-exporter tests passed')

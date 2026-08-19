@@ -58,3 +58,31 @@
 ## Rename and permission hardening semantic commit information
 - Title: `feat(cursor-exporter): harden session archive permissions`
 - Description: `Rename the Cursor-specific exporter and enforce owner-only permissions across staging, generated files, copied artifacts, and validated session bundles.`
+
+## Reference intelligence checklist
+- [x] 1. Preserve individual reference occurrences and aggregate repeated evidence by edge.
+- [x] 2. Add deterministic evidence categories, identifier precedence, confidence, topics, and relevance.
+- [x] 3. Compute shortest vectors, depth, direct/indirect relationships, and strongly connected cycle groups.
+- [x] 4. Add recursive, direct, relevant, and none reference scopes.
+- [x] 5. Generate complete/relevant graphs, evidence JSONL, summaries, and readable indexes.
+- [x] 6. Integrate schema v2 manifests, restore context, bootstrap prompts, reports, validation, and console summaries.
+- [x] 7. Update the project plan and implementation history.
+- [x] 8. Extend fixtures for categories, precedence, vectors, cycles, unresolved prefixes, scopes, omissions, determinism, and permissions.
+- [x] 9. Regenerate and validate the real session export.
+
+## Reference intelligence verification
+- Fixture suite: `groovy tests/cursor-session-exporter-test.groovy` passed.
+- Fixture evidence covered explicit links, ordinary messages, summaries, transcript paths, Shell commands, tool inputs, file content, repeated aggregation, full-UUID precedence, and ambiguous prefixes.
+- Fixture graph covered direct, indirect, cyclic, primary, supporting, and incidental nodes with deterministic shortest vectors.
+- Scope fixtures verified recursive, direct, relevant, and none exports while retaining the complete graph and omitting unselected directories.
+- New graph, evidence, summary, index, and restore files retained owner-only permissions.
+- Real export resolved 14 references and 30 edges with 4 primary and 10 supporting sessions.
+- The current root transcript explicitly mentions all 14 resolved sessions, so its truthful shortest-path result is 14 direct and 0 indirect references.
+- Real graph validation passed across 439 files.
+- Consecutive real exports produced the same reference-graph SHA-256: `fee618d32644b0060741b9361126a20bbbd2da0cf2dcc8cd8c86aed212218d8e`.
+- The second real export reused 84 unchanged artifacts.
+- No commit or push was performed.
+
+## Reference intelligence semantic commit information
+- Title: `feat(cursor-exporter): add reference intelligence`
+- Description: `Classify session references by evidence, confidence, relevance, depth, and cycles while adding scoped exports and deterministic graph views for forensic and restoration workflows.`

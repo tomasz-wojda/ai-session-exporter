@@ -13,6 +13,7 @@
 - Search Cursor transcript roots matching `~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl`.
 - Reject malformed, missing, and ambiguous identifiers with distinct nonzero exit codes.
 - Support output, transcript-root, terminal-root, agent-tool-root, and workspace overrides.
+- Support `--reference-scope recursive|direct|relevant|none`, defaulting to `recursive`.
 - Use Groovy and JDK facilities only.
 
 ## Export model
@@ -20,7 +21,7 @@
 - Use JSON for manifests, indexes, reports, summaries, checkpoints, and restore context.
 - Use JSONL for ordered event streams.
 - Export top-level metadata plus conditional `session`, `scripts`, `commands`, `artifacts`, `workspace`, `integrity`, and `references` sections.
-- Recursively export referenced sessions beneath `references/<full-uuid>/`.
+- Always discover the complete reference graph and materialize referenced sessions beneath `references/<full-uuid>/` according to the selected scope.
 - Omit empty optional directories and preserve raw secret values unchanged.
 
 ## Parsing and provenance
@@ -28,6 +29,9 @@
 - Normalize user queries, assistant responses, context, summaries, tool calls, and available tool results.
 - Resolve UUIDs and unique prefixes only against locally indexed transcripts.
 - Detect reference cycles and record the relationship graph.
+- Preserve every resolved UUID or unique-prefix occurrence as evidence before aggregating repeated occurrences into graph edges.
+- Classify evidence as explicit session links, messages, summaries, transcript paths, Shell commands, tool input, or file content.
+- Assign deterministic confidence and relevance from evidence type and shortest-path confidence without semantic guessing.
 - Extract file mutations from Write, Edit, ApplyPatch, and EditNotebook calls.
 - Preserve mutation payloads and snapshot existing explicitly referenced workspace files.
 - Extract every Shell command and correlate terminal evidence by exact command, normalized command, then title or description.
@@ -36,9 +40,24 @@
 
 ## Restoration and indexing
 - Generate restore context containing session identity, relationships, available rules/context, checkpoint state, workspace mappings, required files, and a bootstrap prompt.
+- Generate schema-v2 manifests and restore contexts with the selected reference scope, reference-model version, graph paths, direct/relevant summaries, and shortest vectors.
+- Prioritize primary and supporting references in restoration while retaining the complete forensic graph.
 - Generate indexes for paths, hosts, URLs, commands, identifiers, tools, and artifacts.
 - Link prompts, responses, tool calls, results, file operations, and artifacts with stable content-derived IDs.
 - Distinguish current workspace observations from historical transcript evidence.
+
+## Reference intelligence
+- Classify nodes as root, direct, indirect, or cyclic and retain unresolved identifiers separately.
+- Compute shortest depth and vectors with breadth-first traversal; cycle membership must not change shortest paths.
+- Detect strongly connected cycle groups and mark participating edges.
+- Derive topics deterministically from the first user query after removing transcript wrapper tags and timestamps.
+- Assign high confidence to explicit full-UUID prose references, medium confidence to unique prefixes in meaningful prose or summaries, and low confidence to paths, commands, tool inputs, and file payloads.
+- Prefer full UUIDs over prefixes and meaningful prose over tool/path evidence when selecting an edge's strongest occurrence.
+- Classify direct high-confidence prose references as primary, high/medium-only paths as supporting, and paths containing low-confidence evidence as incidental.
+- Keep `recursive` exports complete, limit `direct` exports to depth one, limit `relevant` exports to primary/supporting nodes, and let `none` export only the root.
+- Always write the complete graph, evidence stream, summary, readable index, and relevant graph regardless of the materialization scope.
+- Include detected, direct, indirect, exported, omitted, cycle, confidence, and relevance counts in graph metadata and reports.
+- Keep nodes, edges, evidence, vectors, cycle groups, and indexes deterministically ordered.
 
 ## Reliability
 - Build in a staging directory, validate, then atomically replace the destination.
@@ -82,3 +101,13 @@ HARDENING CHECKLIST:
 5. Add security metadata and read-only permission validation.
 6. Extend fixture coverage for `0700` directories and `0600` files.
 7. Regenerate and validate the real session bundle.
+
+REFERENCE INTELLIGENCE CHECKLIST:
+1. Preserve and aggregate individual reference evidence occurrences.
+2. Add deterministic evidence categories, confidence precedence, topics, and relevance.
+3. Compute shortest vectors, depth, direct/indirect relationships, and cycle groups.
+4. Add recursive, direct, relevant, and none export scopes.
+5. Generate complete/relevant graph views, evidence, summary, and readable index outputs.
+6. Integrate schema v2 restoration, reporting, validation, and console summaries.
+7. Extend fixtures for classifications, precedence, cycles, scopes, omission handling, determinism, and permissions.
+8. Regenerate and validate the real session bundle.
