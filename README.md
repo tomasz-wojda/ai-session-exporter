@@ -11,24 +11,17 @@ Export a Cursor session into a validated JSON/JSONL bundle containing conversati
 
 The exporter has no third-party project dependencies. It has been tested with Groovy 6.0.0-beta-1 and Java 26.0.2.
 
-Verify the runtime:
-
-```sh
-java -version
-groovy --version
-```
-
-On macOS, Groovy can be installed with Homebrew using `brew install groovy`. On Linux, install Groovy 6 through SDKMAN or the system package manager.
-
 ## User installation
 
 From the repository root:
 
 ```sh
 chmod u+x cursor/cursor-session-exporter.groovy
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$PWD/cursor/cursor-session-exporter.groovy" "$HOME/.local/bin/cursor-session-exporter"
+mkdir -p ~/.local/bin
+ln -sfn "$PWD/cursor/cursor-session-exporter.groovy" ~/.local/bin/cursor-session-exporter
 ```
+
+Do not quote a path beginning with `~`; quoted `"~"` is treated literally and is not expanded by the shell. Use unquoted `~` as above or quoted `$HOME`.
 
 Add this line to `~/.zshrc` on macOS/zsh or `~/.bashrc` on Linux/bash:
 
@@ -46,20 +39,38 @@ The symlink is preferable to an alias because it works across shells and subproc
 
 ## Configuration
 
-Save reusable defaults without a session ID:
+After installing the symlink, inspect the initial configuration:
 
 ```sh
-cursor-session-exporter config \
-  --output-dir "$HOME/sessions-export" \
-  --reference-scope relevant
+cursor-session-exporter config
 ```
 
-Every persistent export option can be stored:
+```json
+{
+    "version": 1
+}
+```
+
+Save the home directory as the default output location:
+
+```sh
+cursor-session-exporter config --output-dir ~/
+```
+
+```json
+{
+    "outputDir": "/Users/localuser",
+    "version": 1
+}
+```
+
+`/Users/localuser` represents the current user's resolved home directory; the actual value differs by account and operating system.
+
+Persistent path options can be stored together:
 
 ```sh
 cursor-session-exporter config \
   --output-dir "$HOME/sessions-export" \
-  --reference-scope relevant \
   --transcript-root "$HOME/.cursor/projects/example/agent-transcripts" \
   --terminal-root "$HOME/.cursor/projects/example/terminals" \
   --agent-tool-root "$HOME/.cursor/projects/example/agent-tools" \
@@ -142,16 +153,34 @@ This option is normally unnecessary. Use it when workspace inference is unavaila
 
 ## Reference scope
 
-The default scope is `relevant`:
-
-```sh
-groovy "$SCRIPT" "$SESSION" --reference-scope relevant
-```
+The built-in default scope is `relevant`.
 
 - `recursive`: export every resolved referenced session.
 - `direct`: export only depth-one references.
 - `relevant`: export references classified as primary or supporting.
 - `none`: export only the root session.
+
+Persist the preferred scope:
+
+```sh
+cursor-session-exporter config --reference-scope relevant
+```
+
+If the output directory was configured as shown earlier, the resulting configuration is:
+
+```json
+{
+    "outputDir": "/Users/localuser",
+    "referenceScope": "relevant",
+    "version": 1
+}
+```
+
+Override the scope for one export:
+
+```sh
+groovy "$SCRIPT" "$SESSION" --reference-scope recursive
+```
 
 The complete forensic reference graph is always generated. Scope controls which referenced session directories are materialized.
 
