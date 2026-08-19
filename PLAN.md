@@ -1,14 +1,14 @@
 # Cursor Session Exporter
 
 ## Deliverables
-- Create `cursor/session-exporter.groovy` as a standalone, dependency-free Groovy 6 entry point.
-- Create `cursor/tests/session-exporter-test.groovy` with isolated fixtures under `cursor/tests/fixtures/`.
+- Create `cursor/cursor-session-exporter.groovy` as a standalone, dependency-free Groovy 6 entry point.
+- Create `cursor/tests/cursor-session-exporter-test.groovy` with isolated fixtures under `cursor/tests/fixtures/`.
 - Export bundles under `cursor/sessions-export/<full-session-uuid>/`.
 - Preserve the approved implementation checklist and verification record in `IMPLEMENTATION.md`.
 - Do not create commits, push changes, or add documentation beyond `PLAN.md` and `IMPLEMENTATION.md`.
 
 ## CLI and discovery
-- Invoke with `groovy session-exporter.groovy <session_id>`.
+- Invoke with `groovy cursor-session-exporter.groovy <session_id>`.
 - Accept a full UUID or a unique eight-character hexadecimal prefix.
 - Search Cursor transcript roots matching `~/.cursor/projects/*/agent-transcripts/<uuid>/<uuid>.jsonl`.
 - Reject malformed, missing, and ambiguous identifiers with distinct nonzero exit codes.
@@ -46,12 +46,17 @@
 - Reuse unchanged checksum-addressed artifacts on rerun and avoid duplicate events.
 - Validate JSON/JSONL syntax, required fields, event ordering, IDs, references, checksums, containment, and manifest counts.
 - Treat unavailable historical evidence as reported incompleteness rather than fabricated data.
+- Enforce `0700` on the output root and every exported directory and `0600` on every exported file.
+- Apply permissions during staging, after copied attributes, before atomic replacement, and after replacement.
+- Use POSIX permissions where available and owner-only Java file flags as a best-effort fallback.
+- Keep validation read-only while reporting any POSIX permission mismatch.
 
 ## Verification
 - Cover UUID and prefix resolution, malformed input, extraction, revision reconstruction, command correlation, recursive references, cycles, checksums, determinism, incremental reuse, and atomic recovery.
 - Run an integration fixture against synthetic transcript, terminal, and agent-tool roots.
 - Run a real export for `6ab4f267-fa2e-4f6f-9cec-8a06fd864a6f`.
 - Verify known Automox references, successful and failed/background command evidence, and bundle validation.
+- Verify all POSIX export directories are `0700` and all export files are `0600`, including copied artifacts and terminal logs.
 - Provide a semantic commit title and description without committing or pushing.
 
 IMPLEMENTATION CHECKLIST:
@@ -68,3 +73,12 @@ IMPLEMENTATION CHECKLIST:
 11. Add unit and integration fixtures.
 12. Run tests and the real session export.
 13. Record verification results and provide the semantic commit title and description.
+
+HARDENING CHECKLIST:
+1. Rename the Cursor exporter and test files.
+2. Update executable-name references and manifest metadata.
+3. Add POSIX and owner-only fallback permission helpers.
+4. Secure output roots, staging trees, generated files, copied artifacts, and atomic replacements.
+5. Add security metadata and read-only permission validation.
+6. Extend fixture coverage for `0700` directories and `0600` files.
+7. Regenerate and validate the real session bundle.

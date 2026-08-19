@@ -9,6 +9,7 @@ import java.nio.file.Paths
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 
 Map runCommand(List<String> command, Path directory) {
@@ -49,8 +50,29 @@ List<Map> readJsonLines(Path path) {
     rows
 }
 
+boolean supportsPosix(Path path) {
+    Files.getFileStore(path).supportsFileAttributeView('posix')
+}
+
+void assertSecureTree(Path outputRoot, Path bundle) {
+    if (!supportsPosix(bundle)) {
+        return
+    }
+    assert PosixFilePermissions.toString(Files.getPosixFilePermissions(outputRoot)) == 'rwx------'
+    Files.walk(bundle).withCloseable { stream ->
+        stream.forEach { Path path ->
+            if (Files.isDirectory(path)) {
+                assert PosixFilePermissions.toString(Files.getPosixFilePermissions(path)) == 'rwx------': path
+            } else if (Files.isRegularFile(path)) {
+                assert PosixFilePermissions.toString(Files.getPosixFilePermissions(path)) == 'rw-------': path
+            }
+        }
+    }
+}
+
 Path cursorRoot = Paths.get(System.getProperty('user.dir')).toAbsolutePath().normalize()
-Path exporter = cursorRoot.resolve('session-exporter.groovy')
+Path exporter = cursorRoot.resolve('cursor-session-exporter.groovy')
+assert !Files.exists(cursorRoot.resolve('session-exporter.groovy'))
 Path fixtureRoot = cursorRoot.resolve('tests/fixtures')
 Path temporary = Files.createTempDirectory('session-exporter-test-')
 Path project = temporary.resolve('cursor-project')
@@ -58,6 +80,10 @@ Path workspace = temporary.resolve('workspace')
 Path output = temporary.resolve('output')
 copyTree(fixtureRoot.resolve('cursor-project'), project)
 copyTree(fixtureRoot.resolve('workspace'), workspace)
+if (supportsPosix(project)) {
+    Files.setPosixFilePermissions(project.resolve('agent-tools/result.txt'), PosixFilePermissions.fromString('rw-r--r--'))
+    Files.setPosixFilePermissions(project.resolve('terminals/1.txt'), PosixFilePermissions.fromString('rw-r--r--'))
+}
 
 Path rootTranscript = project.resolve('agent-transcripts/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl')
 String transcriptText = Files.readString(rootTranscript, StandardCharsets.UTF_8)
@@ -88,6 +114,7 @@ assert Files.isDirectory(bundle)
 assert Files.isRegularFile(bundle.resolve('aaaaaaaa-manifest.json'))
 assert Files.isRegularFile(bundle.resolve('session/aaaaaaaa-session.jsonl'))
 assert Files.isRegularFile(bundle.resolve('references/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/session/bbbbbbbb-session.jsonl'))
+assertSecureTree(output, bundle)
 
 Map graph = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-reference-graph.json').toFile()) as Map
 assert (graph.sessions as List).contains('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
@@ -112,6 +139,10 @@ assert (artifactIndex.artifacts as List).any { it.sourcePath.toString().endsWith
 
 Map validation = new JsonSlurper().parse(bundle.resolve('integrity/aaaaaaaa-validation.json').toFile()) as Map
 assert validation.valid
+Map manifest = new JsonSlurper().parse(bundle.resolve('aaaaaaaa-manifest.json').toFile()) as Map
+assert manifest.exporter == 'cursor-session-exporter.groovy'
+assert manifest.security.directoryMode == '0700'
+assert manifest.security.fileMode == '0600'
 Path stableTimeline = bundle.resolve('session/aaaaaaaa-session.jsonl')
 String firstTimelineHash = sha256(stableTimeline)
 
@@ -122,6 +153,14 @@ assert sha256(stableTimeline) == firstTimelineHash
 
 Map validateOnly = runCommand(base + ['--validate-only'], cursorRoot)
 assert validateOnly.exitCode == 0: validateOnly.output
+if (supportsPosix(bundle)) {
+    Path manifestPath = bundle.resolve('aaaaaaaa-manifest.json')
+    Files.setPosixFilePermissions(manifestPath, PosixFilePermissions.fromString('rw-r--r--'))
+    Map insecureValidation = runCommand(base + ['--validate-only'], cursorRoot)
+    assert insecureValidation.exitCode == 8
+    assert PosixFilePermissions.toString(Files.getPosixFilePermissions(manifestPath)) == 'rw-r--r--'
+    Files.setPosixFilePermissions(manifestPath, PosixFilePermissions.fromString('rw-------'))
+}
 
 Map fullUuid = runCommand(base.with { List<String> values ->
     List<String> copy = new ArrayList<>(values)
@@ -165,4 +204,4 @@ assert Files.isRegularFile(stableTimeline)
 assert sha256(stableTimeline) == preservedHash
 Files.writeString(rootTranscript, originalTranscript, StandardCharsets.UTF_8)
 
-println('session-exporter tests passed')
+println('cursor-session-exporter tests passed')

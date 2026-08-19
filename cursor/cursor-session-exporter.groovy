@@ -4,13 +4,17 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.FileVisitResult
+import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.regex.Pattern
@@ -34,6 +38,8 @@ class SessionExporter {
     static final Set<String> FILE_TOOLS = ['write', 'edit', 'applypatch', 'editnotebook', 'delete'] as Set
     static final Set<String> SHELL_TOOLS = ['shell', 'awaitshell', 'await'] as Set
     static final int MAX_SNAPSHOT_BYTES = 25 * 1024 * 1024
+    static final Set<PosixFilePermission> DIRECTORY_PERMISSIONS = PosixFilePermissions.fromString('rwx------')
+    static final Set<PosixFilePermission> FILE_PERMISSIONS = PosixFilePermissions.fromString('rw-------')
 
     Map options
     Path scriptDir
@@ -59,17 +65,17 @@ class SessionExporter {
             exporter.execute()
             return 0
         } catch (ExportFailure failure) {
-            System.err.println("session-exporter: ${failure.message}")
+            System.err.println("cursor-session-exporter: ${failure.message}")
             return failure.exitCode
         } catch (Throwable failure) {
-            System.err.println("session-exporter: ${failure.class.simpleName}: ${failure.message}")
+            System.err.println("cursor-session-exporter: ${failure.class.simpleName}: ${failure.message}")
             return 9
         }
     }
 
     static Map parseArguments(String[] args) {
         if (!args || args[0] in ['--help', '-h']) {
-            throw new ExportFailure(2, 'usage: groovy session-exporter.groovy <session_id> [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--validate-only]')
+            throw new ExportFailure(2, 'usage: groovy cursor-session-exporter.groovy <session_id> [--output-dir PATH] [--transcript-root PATH] [--terminal-root PATH] [--agent-tool-root PATH] [--workspace PATH] [--validate-only]')
         }
         Map options = [sessionId: args[0], validateOnly: false]
         Set<String> pathOptions = ['--output-dir', '--transcript-root', '--terminal-root', '--agent-tool-root', '--workspace'] as Set
@@ -113,6 +119,7 @@ class SessionExporter {
             println("Validated ${destination}")
             return
         }
+        secureDirectories(outputRoot)
         Path mainTranscript = transcriptIndex[rootSession]
         configureEvidenceRoots(mainTranscript)
         terminalRecords = loadTerminalRecords(options.terminalRoot as Path)
@@ -120,7 +127,7 @@ class SessionExporter {
         Path staging = outputRoot.resolve(".${rootSession}.staging-${UUID.randomUUID()}")
         Path previous = outputRoot.resolve(".${rootSession}.previous-${UUID.randomUUID()}")
         deleteRecursively(staging)
-        Files.createDirectories(staging)
+        secureDirectories(staging)
         try {
             Map rootResult = exportOneSession(rootSession, staging, false, destination)
             Path referenceRoot = staging.resolve('references')
@@ -132,22 +139,25 @@ class SessionExporter {
             }
             writeRootRelationshipFiles(staging, rootSession, graph, rootResult)
             writeIntegrity(staging)
+            hardenTree(staging)
             Map validation = validateBundle(staging)
             writeJson(staging.resolve('integrity').resolve("${rootSession.take(8)}-validation.json"), validation)
             if (!validation.valid) {
                 throw new ExportFailure(8, "validation failed: ${(validation.errors as List).join('; ')}")
             }
-            Files.createDirectories(outputRoot)
+            hardenTree(staging)
             boolean hadDestination = Files.exists(destination)
             if (hadDestination) {
                 movePath(destination, previous)
             }
             try {
                 movePath(staging, destination)
+                hardenTree(destination)
                 deleteRecursively(previous)
             } catch (Throwable moveFailure) {
                 if (hadDestination && Files.exists(previous) && !Files.exists(destination)) {
                     movePath(previous, destination)
+                    hardenTree(destination)
                 }
                 throw moveFailure
             }
@@ -319,12 +329,12 @@ class SessionExporter {
     }
 
     Map exportOneSession(String sessionId, Path destination, boolean referenced, Path existingDestination) {
-        Files.createDirectories(destination)
+        secureDirectories(destination)
         String prefix = sessionId.take(8)
         List<Map> records = parseTranscript(sessionId)
         Map normalized = normalizeEvents(sessionId, records)
         Path sessionDir = destination.resolve('session')
-        Files.createDirectories(sessionDir)
+        secureDirectories(sessionDir)
         writeJsonLines(sessionDir.resolve("${prefix}-session.jsonl"), normalized.timeline as List)
         writeConditionalJsonLines(sessionDir, "${prefix}-queries.jsonl", normalized.queries as List)
         writeConditionalJsonLines(sessionDir, "${prefix}-responses.jsonl", normalized.responses as List)
@@ -332,7 +342,9 @@ class SessionExporter {
         writeConditionalJsonLines(sessionDir, "${prefix}-tool-calls.jsonl", normalized.toolCalls as List)
         writeConditionalJsonLines(sessionDir, "${prefix}-tool-results.jsonl", normalized.toolResults as List)
         writeConditionalJsonLines(sessionDir, "${prefix}-summaries.jsonl", normalized.summaries as List)
-        Files.copy(transcriptIndex[sessionId], sessionDir.resolve("${prefix}-raw-transcript.jsonl"), StandardCopyOption.REPLACE_EXISTING)
+        Path rawTranscript = sessionDir.resolve("${prefix}-raw-transcript.jsonl")
+        Files.copy(transcriptIndex[sessionId], rawTranscript, StandardCopyOption.REPLACE_EXISTING)
+        secureFile(rawTranscript)
 
         Map scripts = exportScripts(sessionId, normalized.toolCalls as List, destination, existingDestination)
         Map commands = exportCommands(sessionId, normalized.toolCalls as List, destination, existingDestination)
@@ -364,12 +376,13 @@ class SessionExporter {
         writeJson(destination.resolve("${prefix}-restore-context.json"), restore)
         Map manifest = [
             schemaVersion: 1,
-            exporter: 'session-exporter.groovy',
+            exporter: 'cursor-session-exporter.groovy',
             sessionId: sessionId,
             prefix: prefix,
             referenced: referenced,
             sourceTranscript: transcriptIndex[sessionId].toString(),
             exportedAt: Instant.now().toString(),
+            security: securityMetadata(destination),
             counts: summary,
             paths: listRelativeFiles(destination)
         ]
@@ -500,14 +513,16 @@ class SessionExporter {
             return [operationCount: 0, revisionCount: 0, snapshotCount: 0]
         }
         Path scriptsDir = destination.resolve('scripts')
-        Files.createDirectories(scriptsDir)
+        secureDirectories(scriptsDir)
         writeJsonLines(scriptsDir.resolve("${prefix}-file-operations.jsonl"), operations)
         writeConditionalJsonLines(scriptsDir, "${prefix}-revisions.jsonl", revisions)
         Path patchesDir = scriptsDir.resolve('patches')
         operations.findAll { it.operation == 'applypatch' }.each { Map operation ->
-            Files.createDirectories(patchesDir)
+            secureDirectories(patchesDir)
             String payload = canonicalJson(operation.input)
-            Files.writeString(patchesDir.resolve("${operation.eventId}.patch"), payload, StandardCharsets.UTF_8)
+            Path patchPath = patchesDir.resolve("${operation.eventId}.patch")
+            Files.writeString(patchPath, payload, StandardCharsets.UTF_8)
+            secureFile(patchPath)
         }
         List<Map> snapshots = []
         paths.each { String rawPath ->
@@ -518,7 +533,7 @@ class SessionExporter {
                     String safeName = safeFileName(path)
                     Path relative = Paths.get('scripts', 'snapshots', 'final', safeName)
                     Path target = destination.resolve(relative)
-                    Files.createDirectories(target.parent)
+                    secureDirectories(target.parent)
                     copyWithReuse(path, target, existingDestination?.resolve(relative))
                     snapshots << [sourcePath: path.toString(), exportPath: relative.toString(), size: size, sha256: sha256(path)]
                 } else {
@@ -635,7 +650,7 @@ class SessionExporter {
             return [commandCount: 0, matchedCount: 0]
         }
         Path commandDir = destination.resolve('commands')
-        Files.createDirectories(commandDir)
+        secureDirectories(commandDir)
         writeJsonLines(commandDir.resolve("${prefix}-commands.jsonl"), commands)
         writeConditionalJsonLines(commandDir, "${prefix}-command-results.jsonl", results)
         List<Map> copiedLogs = []
@@ -644,7 +659,7 @@ class SessionExporter {
             if (Files.isRegularFile(source)) {
                 Path relative = Paths.get('commands', 'terminal-logs', source.fileName.toString())
                 Path target = destination.resolve(relative)
-                Files.createDirectories(target.parent)
+                secureDirectories(target.parent)
                 copyWithReuse(source, target, existingDestination?.resolve(relative))
                 copiedLogs << [sourcePath: source.toString(), exportPath: relative.toString(), sha256: sha256(source)]
             }
@@ -775,7 +790,7 @@ class SessionExporter {
             if (source != null && Files.isRegularFile(source) && Files.size(source) <= MAX_SNAPSHOT_BYTES) {
                 Path relative = Paths.get('artifacts', 'files', safeFileName(source))
                 Path target = destination.resolve(relative)
-                Files.createDirectories(target.parent)
+                secureDirectories(target.parent)
                 copyWithReuse(source, target, existingDestination?.resolve(relative))
                 artifacts << [sourcePath: source.toString(), exportPath: relative.toString(), size: Files.size(source), sha256: sha256(source)]
             } else {
@@ -784,7 +799,7 @@ class SessionExporter {
         }
         if (!artifacts.isEmpty()) {
             Path artifactsDir = destination.resolve('artifacts')
-            Files.createDirectories(artifactsDir)
+            secureDirectories(artifactsDir)
             writeJson(artifactsDir.resolve("${prefix}-artifacts.json"), [artifacts: artifacts])
         }
         [artifactCount: artifacts.size(), artifacts: artifacts]
@@ -812,7 +827,7 @@ class SessionExporter {
             canonicalJson(it.content).contains('<rules>') || canonicalJson(it.content).contains('<user_rule>')
         }
         Path workspaceDir = destination.resolve('workspace')
-        Files.createDirectories(workspaceDir)
+        secureDirectories(workspaceDir)
         writeJson(workspaceDir.resolve("${prefix}-environment.json"), runtime)
         writeJson(workspaceDir.resolve("${prefix}-git-state.json"), git)
         writeJson(workspaceDir.resolve("${prefix}-open-files.json"), [paths: openFiles.toList()])
@@ -896,7 +911,7 @@ class SessionExporter {
         String prefix = rootSession.take(8)
         writeJson(staging.resolve("${prefix}-reference-graph.json"), graph)
         Path integrityDir = staging.resolve('integrity')
-        Files.createDirectories(integrityDir)
+        secureDirectories(integrityDir)
         List<Map> issues = (completeness + (graph.unresolved as List)).sort { a, b -> canonicalJson(a) <=> canonicalJson(b) }
         writeJson(integrityDir.resolve("${prefix}-missing-items.json"), [items: issues])
         writeJson(integrityDir.resolve("${prefix}-unmatched-results.json"), [items: issues.findAll { it.type == 'command_result_unmatched' }])
@@ -906,6 +921,7 @@ class SessionExporter {
             referenceCount: (graph.sessions as List).size() - 1,
             completenessIssues: issues.size(),
             reusedArtifacts: reusedArtifacts,
+            security: securityMetadata(staging),
             generatedAt: Instant.now().toString()
         ])
     }
@@ -929,7 +945,7 @@ class SessionExporter {
             }
         }
         Path integrityDir = staging.resolve('integrity')
-        Files.createDirectories(integrityDir)
+        secureDirectories(integrityDir)
         writeJson(integrityDir.resolve("${prefix}-checksums.json"), [algorithm: 'SHA-256', files: checksums])
     }
 
@@ -938,6 +954,7 @@ class SessionExporter {
         if (!Files.isDirectory(root)) {
             return [valid: false, errors: ["bundle not found: ${root}"], checkedFiles: 0]
         }
+        errors.addAll(validatePermissions(root))
         int checked = 0
         Map<Path, Integer> timelineCounts = [:]
         Files.walk(root).withCloseable { stream ->
@@ -1057,6 +1074,7 @@ class SessionExporter {
         } else {
             Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES)
         }
+        secureFile(target)
     }
 
     Path resolveWorkspacePath(String rawPath) {
@@ -1115,19 +1133,134 @@ class SessionExporter {
     }
 
     void writeJsonLines(Path path, List items) {
-        Files.createDirectories(path.parent)
+        secureDirectories(path.parent)
         path.toFile().withWriter(StandardCharsets.UTF_8.name()) { writer ->
             items.each { item ->
                 writer.write(canonicalJson(item))
                 writer.write('\n')
             }
         }
+        secureFile(path)
     }
 
     void writeJson(Path path, Object value) {
-        Files.createDirectories(path.parent)
+        secureDirectories(path.parent)
         String compact = canonicalJson(value)
         Files.writeString(path, JsonOutput.prettyPrint(compact) + '\n', StandardCharsets.UTF_8)
+        secureFile(path)
+    }
+
+    void secureDirectories(Path path) {
+        if (path == null) {
+            return
+        }
+        List<Path> missing = []
+        Path current = path
+        while (current != null && !Files.exists(current)) {
+            missing << current
+            current = current.parent
+        }
+        missing.reverseEach { Path directory ->
+            try {
+                if (supportsPosix(directory.parent ?: directory)) {
+                    Files.createDirectory(directory, PosixFilePermissions.asFileAttribute(DIRECTORY_PERMISSIONS))
+                } else {
+                    Files.createDirectory(directory)
+                }
+            } catch (FileAlreadyExistsException ignored) {
+            }
+            secureDirectory(directory)
+        }
+        if (Files.isDirectory(path)) {
+            secureDirectory(path)
+        }
+    }
+
+    void secureDirectory(Path path) {
+        if (supportsPosix(path)) {
+            Files.setPosixFilePermissions(path, DIRECTORY_PERMISSIONS)
+        } else {
+            setOwnerOnly(path, true)
+        }
+    }
+
+    void secureFile(Path path) {
+        if (supportsPosix(path)) {
+            Files.setPosixFilePermissions(path, FILE_PERMISSIONS)
+        } else {
+            setOwnerOnly(path, false)
+        }
+    }
+
+    void setOwnerOnly(Path path, boolean directory) {
+        File file = path.toFile()
+        boolean reset = file.setReadable(false, false) && file.setWritable(false, false) && file.setExecutable(false, false)
+        boolean owner = file.setReadable(true, true) && file.setWritable(true, true)
+        boolean executable = !directory || file.setExecutable(true, true)
+        if (!reset || !owner || !executable) {
+            throw new IOException("unable to enforce owner-only permissions on ${path}")
+        }
+    }
+
+    boolean supportsPosix(Path path) {
+        Path existing = path
+        while (existing != null && !Files.exists(existing)) {
+            existing = existing.parent
+        }
+        if (existing == null) {
+            return FileSystems.default.supportedFileAttributeViews().contains('posix')
+        }
+        Files.getFileStore(existing).supportsFileAttributeView('posix')
+    }
+
+    void hardenTree(Path root) {
+        if (root == null || !Files.exists(root)) {
+            return
+        }
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+            @Override
+            FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) {
+                secureDirectory(directory)
+                FileVisitResult.CONTINUE
+            }
+
+            @Override
+            FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                secureFile(file)
+                FileVisitResult.CONTINUE
+            }
+        })
+    }
+
+    Map securityMetadata(Path path) {
+        [
+            enforcement: supportsPosix(path) ? 'posix' : 'owner-only-fallback',
+            directoryMode: '0700',
+            fileMode: '0600'
+        ]
+    }
+
+    List<String> validatePermissions(Path root) {
+        List<String> errors = []
+        if (!supportsPosix(root)) {
+            return errors
+        }
+        Path outputDirectory = root.parent
+        if (outputDirectory != null && Files.isDirectory(outputDirectory) && Files.getPosixFilePermissions(outputDirectory) != DIRECTORY_PERMISSIONS) {
+            errors << "directory permissions must be 0700: ${outputDirectory}"
+        }
+        Files.walk(root).withCloseable { stream ->
+            stream.sorted().forEach { Path path ->
+                if (Files.isDirectory(path)) {
+                    if (Files.getPosixFilePermissions(path) != DIRECTORY_PERMISSIONS) {
+                        errors << "directory permissions must be 0700: ${path}"
+                    }
+                } else if (Files.isRegularFile(path) && Files.getPosixFilePermissions(path) != FILE_PERMISSIONS) {
+                    errors << "file permissions must be 0600: ${path}"
+                }
+            }
+        }
+        errors
     }
 
     static String canonicalJson(Object value) {
@@ -1226,7 +1359,7 @@ try {
     sourceLocation = Paths.get(System.getProperty('user.dir')).toAbsolutePath().normalize()
 }
 Path exporterDirectory = Files.isDirectory(sourceLocation) ? sourceLocation : sourceLocation.parent
-if (exporterDirectory == null || !Files.exists(exporterDirectory.resolve('session-exporter.groovy'))) {
+if (exporterDirectory == null || !Files.exists(exporterDirectory.resolve('cursor-session-exporter.groovy'))) {
     exporterDirectory = Paths.get(System.getProperty('user.dir')).toAbsolutePath().normalize()
 }
 System.exit(SessionExporter.run(args, exporterDirectory))
